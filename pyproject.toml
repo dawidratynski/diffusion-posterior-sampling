@@ -18,6 +18,18 @@ dependencies = [
     "tifffile>=2024.1.1",  # EM data is often TIFF
 ]
 
+# Without a [build-system] pip falls back to legacy setuptools, whose flat-layout
+# auto-discovery cannot choose between configs/, data/, guided_diffusion/,
+# scripts/, tests/, util/ ... and aborts with "Getting requirements to build
+# editable did not run successfully". Declaring the packages explicitly fixes
+# `pip install -e .`, which is how Colab installs the dependencies.
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["guided_diffusion", "util", "data"]
+
 # torch is deliberately NOT a project dependency: on Colab / the cluster it is
 # supplied by the environment with CUDA already wired up. Locally we take the
 # CPU build via the `cpu` group so nothing tries to pull a CUDA stack onto a
@@ -28,6 +40,9 @@ dev = ["pytest>=8", "ruff>=0.5"]
 
 [tool.uv]
 default-groups = ["cpu", "dev"]
+# Locally the repo is used in place (scripts %cd here and _bootstrap handles
+# sys.path), so uv should not build and install it into the venv.
+package = false
 
 [[tool.uv.index]]
 name = "pytorch-cpu"

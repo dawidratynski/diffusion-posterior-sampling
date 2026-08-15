@@ -37,7 +37,8 @@ num_res_blocks: 1
 channel_mult: "1,2,2"
 learn_sigma: False
 class_cond: False
-use_checkpoint: False
+use_checkpoint: True   # match crystal_model_config.yaml so the smoke exercises
+                       # the checkpoint/autocast path the real run uses
 attention_resolutions: "16"
 num_heads: 1
 num_head_channels: -1

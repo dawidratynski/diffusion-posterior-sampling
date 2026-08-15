@@ -20,7 +20,10 @@ channel_mult: "1,1,2,2,4"
 # Pair with a fixed_* model_var_type in the diffusion config.
 learn_sigma: False
 class_cond: False
-use_checkpoint: False
+# Gradient checkpointing: recomputes activations in backward instead of storing
+# them. ~30% slower per step but a large memory saving, which buys batch size at
+# 160px. Correct under AMP now that CheckpointFunction restores autocast state.
+use_checkpoint: True
 
 # 160 // 20 = 8, a downsample factor the network actually has.
 attention_resolutions: "20"

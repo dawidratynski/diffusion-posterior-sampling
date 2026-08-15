@@ -192,3 +192,56 @@ def test_ema_update_count_survives_checkpoint_roundtrip(tmp_path):
     restored.load_state_dict(ck["ema"])
     restored.num_updates = ck["ema_updates"]
     assert restored.current_decay() == pytest.approx(ema.current_decay())
+
+
+@pytest.mark.parametrize("use_checkpoint", [False, True])
+def test_amp_backward_works_with_gradient_checkpointing(use_checkpoint):
+    """Reproduces the Colab crash:
+
+        RuntimeError: Input type (c10::Half) and bias type (float)
+                      should be the same
+
+    CheckpointFunction.backward re-runs the forward, and without restoring the
+    autocast state that recomputation is fp32 while the saved activations are
+    fp16. Exercised on CPU via bfloat16 autocast, which hits the same code path.
+    """
+    model = create_model(
+        image_size=32, num_channels=32, num_res_blocks=1, channel_mult="1,2",
+        learn_sigma=False, attention_resolutions="16", num_heads=1,
+        num_head_channels=-1, use_checkpoint=use_checkpoint,
+    )
+    tr = DiffusionTrainer("linear", 1000, DEVICE)
+    x = torch.randn(2, 3, 32, 32).clamp(-1, 1)
+
+    with torch.amp.autocast("cpu", dtype=torch.bfloat16):
+        loss = tr.loss(model, x)
+    loss.backward()
+
+    grads = [p.grad for p in model.parameters() if p.grad is not None]
+    assert grads, "no gradients produced"
+    assert all(torch.isfinite(g).all() for g in grads)
+
+
+def test_attention_block_honours_use_checkpoint():
+    """Upstream hardcoded checkpointing on regardless of the flag."""
+    from guided_diffusion.unet import AttentionBlock
+
+    assert AttentionBlock(32, num_heads=1, use_checkpoint=False).use_checkpoint is False
+    assert AttentionBlock(32, num_heads=1, use_checkpoint=True).use_checkpoint is True
+
+    calls = []
+    import guided_diffusion.unet as unet_mod
+    real = unet_mod.checkpoint
+
+    def spy(func, inputs, params, flag):
+        calls.append(flag)
+        return real(func, inputs, params, flag)
+
+    unet_mod.checkpoint = spy
+    try:
+        AttentionBlock(32, num_heads=1, use_checkpoint=False)(torch.randn(1, 32, 8, 8))
+        AttentionBlock(32, num_heads=1, use_checkpoint=True)(torch.randn(1, 32, 8, 8))
+    finally:
+        unet_mod.checkpoint = real
+
+    assert calls == [False, True], f"flag not forwarded: {calls}"

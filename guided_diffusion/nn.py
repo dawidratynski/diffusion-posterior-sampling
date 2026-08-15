@@ -145,6 +145,16 @@ class CheckpointFunction(th.autograd.Function):
         ctx.run_function = run_function
         ctx.input_tensors = list(args[:length])
         ctx.input_params = list(args[length:])
+        # Record the autocast state: backward recomputes this function, and
+        # without restoring autocast the recomputation runs in fp32 while the
+        # saved activations are fp16, giving
+        # "Input type (c10::Half) and bias type (float) should be the same".
+        # Take the device type from the inputs rather than assuming CUDA, so
+        # this holds for CPU autocast too.
+        ctx.device_type = (args[0].device.type
+                           if length > 0 and th.is_tensor(args[0]) else 'cuda')
+        ctx.autocast_enabled = th.is_autocast_enabled(ctx.device_type)
+        ctx.autocast_dtype = th.get_autocast_dtype(ctx.device_type)
         with th.no_grad():
             output_tensors = ctx.run_function(*ctx.input_tensors)
         return output_tensors
@@ -152,7 +162,9 @@ class CheckpointFunction(th.autograd.Function):
     @staticmethod
     def backward(ctx, *output_grads):
         ctx.input_tensors = [x.detach().requires_grad_(True) for x in ctx.input_tensors]
-        with th.enable_grad():
+        with th.enable_grad(), th.amp.autocast(
+            ctx.device_type, enabled=ctx.autocast_enabled, dtype=ctx.autocast_dtype
+        ):
             # Fixes a bug where the first op in run_function modifies the
             # Tensor storage in place, which is not allowed for detach()'d
             # Tensors.

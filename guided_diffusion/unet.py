@@ -365,7 +365,12 @@ class AttentionBlock(nn.Module):
         self.proj_out = zero_module(conv_nd(1, channels, channels, 1))
 
     def forward(self, x):
-        return checkpoint(self._forward, (x,), self.parameters(), True)
+        # Upstream hardcoded True here, so attention blocks were always
+        # gradient-checkpointed even with use_checkpoint: False -- paying the
+        # recompute cost nobody asked for, and dragging the checkpoint/autocast
+        # interaction into every AMP run. Honour the flag like ResBlock does.
+        return checkpoint(self._forward, (x,), self.parameters(),
+                          self.use_checkpoint)
 
     def _forward(self, x):
         b, c, *spatial = x.shape

@@ -56,7 +56,9 @@ def parse_args():
     p.add_argument('--grad_clip', type=float, default=1.0)
     p.add_argument('--log_every', type=int, default=100)
     p.add_argument('--save_every', type=int, default=5_000)
-    p.add_argument('--num_workers', type=int, default=4)
+    # Colab gives 2 vCPUs; a hardcoded 4 oversubscribes and torch warns about it.
+    p.add_argument('--num_workers', type=int,
+                   default=min(4, max(1, (os.cpu_count() or 2) - 1)))
     p.add_argument('--device', type=str, default=None,
                    help="Defaults to cuda when available, else cpu.")
     p.add_argument('--amp', action='store_true',

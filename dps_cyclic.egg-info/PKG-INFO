@@ -1,0 +1,14 @@
+Metadata-Version: 2.4
+Name: dps-cyclic
+Version: 0.1.0
+Summary: DPS with CycleGAN/UVCGAN generators as measurement operators
+Requires-Python: >=3.11
+Requires-Dist: numpy>=1.24
+Requires-Dist: pyyaml>=6
+Requires-Dist: matplotlib>=3.7
+Requires-Dist: pillow>=10
+Requires-Dist: scipy>=1.11
+Requires-Dist: tqdm>=4.65
+Requires-Dist: scikit-image>=0.22
+Requires-Dist: lpips>=0.1.4
+Requires-Dist: tifffile>=2024.1.1
