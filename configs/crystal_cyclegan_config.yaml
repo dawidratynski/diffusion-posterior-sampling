@@ -1,0 +1,40 @@
+# VALIDATION experiment: reconstruct a held-out REAL image from its own
+# synth-domain projection.
+#
+# sample_condition.py computes y = A(ref_img) itself, so ref_img must be a real
+# image and y = G_{R->S}(r_gt) is its synthetic projection. Reconstructions are
+# scored against the known r_gt.
+#
+# For the actual product -- generating realistic images from synthetic inputs
+# with known lattice parameters -- use scripts/generate_augmented.py, which
+# takes synthetic images directly as the measurement.
+#
+# NOTE this benchmark structurally favours the UVCGAN baseline: gen_ab was
+# trained with a cycle loss to invert gen_ba. Report that caveat.
+
+conditioning:
+  method: ps
+  params:
+    # DPS is very sensitive to this. Sweep it before comparing against the
+    # GAN baseline -- 0.3 is the FFHQ default, not a tuned value for this task.
+    scale: 0.3
+
+data:
+  name: crystal
+  root: ../dataset/real/val   # REAL images: the prior's domain
+  image_size: 160
+
+measurement:
+  operator:
+    name: cyclegan
+    # 'stub' lets the whole pipeline run before real weights exist.
+    # Switch to framework: uvcgan2 + path: <uvcgan2 output dir> when they land.
+    framework: stub
+    # real -> synth. This is the operator DPS inverts; the imperfections it
+    # discards are exactly what the R prior fills back in.
+    direction: ba
+
+  noise:
+    # The synthetic conditioning target is known exactly -- there is no
+    # measurement noise. Operator error is absorbed by `scale`.
+    name: clean

@@ -1,15 +1,14 @@
 import math
 import os
-from functools import partial
+
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from tqdm.auto import tqdm
 
 from util.img_utils import clear_color
+
 from .posterior_mean_variance import get_mean_processor, get_var_processor
-
-
 
 __SAMPLER__ = {}
 
@@ -470,7 +469,7 @@ def extract_and_expand(array, time, target):
 def expand_as(array, target):
     if isinstance(array, np.ndarray):
         array = torch.from_numpy(array)
-    elif isinstance(array, np.float):
+    elif isinstance(array, float):
         array = torch.tensor([array])
    
     while array.ndim < target.ndim:

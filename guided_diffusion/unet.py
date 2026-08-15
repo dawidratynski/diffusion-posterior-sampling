@@ -1,24 +1,22 @@
-from abc import abstractmethod
-
+import functools
 import math
+from abc import abstractmethod
 
 import numpy as np
 import torch as th
-import torch.nn as nn
 import torch.nn.functional as F
-import functools
+from torch import nn
 
 from .fp16_util import convert_module_to_f16, convert_module_to_f32
 from .nn import (
+    avg_pool_nd,
     checkpoint,
     conv_nd,
     linear,
-    avg_pool_nd,
-    zero_module,
     normalization,
     timestep_embedding,
+    zero_module,
 )
-
 
 NUM_CLASSES = 1000
 
@@ -84,10 +82,12 @@ def create_model(
         use_new_attention_order=use_new_attention_order,
     )
 
-    try:
+    if model_path:
+        # Deliberately NOT swallowing errors here: upstream caught every
+        # exception and silently fell back to random weights, so a typo'd path
+        # or a config/checkpoint architecture mismatch produced an untrained
+        # model that still sampled happily and looked merely "bad".
         model.load_state_dict(th.load(model_path, map_location='cpu'))
-    except Exception as e:
-        print(f"Got exception: {e} / Randomly initialize")
     return model
 
 class AttentionPool2d(nn.Module):
@@ -967,7 +967,7 @@ class EncoderUNetModel(nn.Module):
 
 class NLayerDiscriminator(nn.Module):
     def __init__(self, input_nc, ndf=64, n_layers=3, norm_layer=nn.BatchNorm2d, use_sigmoid=False):
-        super(NLayerDiscriminator, self).__init__()
+        super().__init__()
         if type(norm_layer) == functools.partial:
             use_bias = norm_layer.func == nn.InstanceNorm2d
         else:
@@ -1029,7 +1029,7 @@ class GANLoss(nn.Module):
         Note: Do not use sigmoid as the last layer of Discriminator.
         LSGAN needs no sigmoid. vanilla GANs will handle it with BCEWithLogitsLoss.
         """
-        super(GANLoss, self).__init__()
+        super().__init__()
         self.register_buffer('real_label', th.tensor(target_real_label))
         self.register_buffer('fake_label', th.tensor(target_fake_label))
         self.gan_mode = gan_mode
@@ -1104,7 +1104,7 @@ def cal_gradient_penalty(netD, real_data, fake_data, device, type='mixed', const
             alpha = alpha.expand(real_data.shape[0], real_data.nelement() // real_data.shape[0]).contiguous().view(*real_data.shape)
             interpolatesv = alpha * real_data + ((1 - alpha) * fake_data)
         else:
-            raise NotImplementedError('{} not implemented'.format(type))
+            raise NotImplementedError(f'{type} not implemented')
         interpolatesv.requires_grad_(True)
         disc_interpolates = netD(interpolatesv)
         gradients = th.autograd.grad(outputs=disc_interpolates, inputs=interpolatesv,

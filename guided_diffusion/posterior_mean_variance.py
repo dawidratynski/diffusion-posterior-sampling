@@ -5,8 +5,6 @@ import torch
 
 from util.img_utils import dynamic_thresholding
 
-
-
 # ====================
 # Model Mean Processor
 # ====================
@@ -168,7 +166,12 @@ class FixedSmallVarianceProcessor(VarianceProcessor):
         )
 
     def get_variance(self, x, t):
-        model_variance = self.posterior_variance
+        # posterior_variance[0] is exactly 0 (alphas_cumprod_prev[0] == 1), so
+        # taking log() of it unclipped yields -inf. Clip the first entry to the
+        # second, matching FixedLargeVarianceProcessor and
+        # GaussianDiffusion.posterior_log_variance_clipped.
+        model_variance = np.append(self.posterior_variance[1],
+                                   self.posterior_variance[1:])
         model_log_variance = np.log(model_variance)
 
         model_variance = extract_and_expand(model_variance, t, x)
@@ -255,7 +258,7 @@ def extract_and_expand(array, time, target):
 def expand_as(array, target):
     if isinstance(array, np.ndarray):
         array = torch.from_numpy(array)
-    elif isinstance(array, np.float):
+    elif isinstance(array, float):
         array = torch.tensor([array])
    
     while array.ndim < target.ndim:

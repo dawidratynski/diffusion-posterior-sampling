@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+
 import torch
 
 __CONDITIONING_METHOD__ = {}
@@ -26,7 +27,12 @@ class ConditioningMethod(ABC):
         return self.operator.project(data=data, measurement=noisy_measurement, **kwargs)
     
     def grad_and_value(self, x_prev, x_0_hat, measurement, **kwargs):
-        if self.noiser.__name__ == 'gaussian':
+        # 'clean' shares the gaussian branch: the L2 data-consistency gradient
+        # does not depend on sigma (sigma only perturbs the measurement itself,
+        # and is folded into `scale` here). Needed when the measurement is known
+        # exactly -- e.g. a generated synthetic image used as the conditioning
+        # target -- which previously fell through to NotImplementedError.
+        if self.noiser.__name__ in ('gaussian', 'clean'):
             difference = measurement - self.operator.forward(x_0_hat, **kwargs)
             norm = torch.linalg.norm(difference)
             norm_grad = torch.autograd.grad(outputs=norm, inputs=x_prev)[0]

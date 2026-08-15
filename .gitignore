@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# external code cloned per README / Dockerfile
+/bkse/
+/motionblur/
+
+# large artefacts - keep these out of git, sync via Drive / cluster storage
+/models/
+/results/
+/logs/
+*.pt
+*.pth
+*.ckpt

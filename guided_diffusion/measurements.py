@@ -2,14 +2,13 @@
 
 from abc import ABC, abstractmethod
 from functools import partial
+
 import yaml
 from torch.nn import functional as F
 from torchvision import torch
-from motionblur.motionblur import Kernel
 
-from util.resizer import Resizer
 from util.img_utils import Blurkernel, fft2_m
-
+from util.resizer import Resizer
 
 # =================
 # Operation classes
@@ -89,6 +88,10 @@ class SuperResolutionOperator(LinearOperator):
 @register_operator(name='motion_blur')
 class MotionBlurOperator(LinearOperator):
     def __init__(self, kernel_size, intensity, device):
+        # Motion blur requires external code (motionblur); imported lazily so the
+        # rest of the operators work without cloning it.
+        from motionblur.motionblur import Kernel
+
         self.device = device
         self.kernel_size = kernel_size
         self.conv = Blurkernel(blur_type='motion',
@@ -198,6 +201,71 @@ class NonlinearBlurOperator(NonLinearOperator):
         blurred = self.blur_model.adaptKernel(data, kernel=random_kernel)
         blurred = (blurred * 2.0 - 1.0).clamp(-1, 1) #[0, 1] -> [-1, 1]
         return blurred
+
+@register_operator(name='cyclegan')
+class CycleGanOperator(NonLinearOperator):
+    '''A trained CycleGAN/UVCGAN generator used as the DPS forward operator.
+
+    DPS solves y = A(x) + n. Here x is a realistic measurement carrying the
+    diffusion prior (trained on the REAL domain), y is a known synthetic image
+    with the lattice parameters we want to keep, and A is the learned
+    real -> synth translation, i.e. the `ba` generator. Sampling therefore
+    yields a realistic image whose synth-domain projection matches y.
+
+    The `ab` generator (synth -> real) is not used by DPS -- it is the direct
+    translation baseline to compare against.
+
+    Why this works: G_{R->S} is trained to strip imperfections, so the
+    information it discards is precisely the imperfection manifold. DPS
+    resamples that null space from the real-image prior rather than collapsing
+    it to one deterministic output, which is what makes repeated sampling from a
+    single synthetic input produce genuinely varied realistic images.
+
+    The critical requirement is differentiability: DPS needs
+    grad_x || y - A(x) ||, so the generator has to stay inside the autograd
+    graph. Its parameters are frozen with requires_grad_(False) (no gradients
+    accumulate on the weights) but forward is NOT run under torch.no_grad(),
+    which would silently zero the guidance term and quietly degrade DPS to
+    unconditional sampling.
+
+    Args:
+        device: torch device.
+        framework: which loader to use -- 'uvcgan2', 'cyclegan_resnet',
+            'torchscript', or 'stub' for development without real weights.
+        direction: 'ab' (synth->real, the operator) or 'ba'.
+        generator: an already-built nn.Module; overrides framework loading.
+        check_range: assert inputs look like [-1, 1]. A silent convention
+            mismatch between the prior and the generator is the single easiest
+            way to get meaningless results, so this defaults on.
+        loader_kwargs: passed through to the loader (e.g. path=...).
+    '''
+
+    def __init__(self, device, direction: str, framework: str = 'stub',
+                 generator=None, check_range: bool = True, **loader_kwargs):
+        # `direction` is deliberately required rather than defaulted: picking the
+        # wrong one still runs and still produces images, just answering the
+        # opposite question. Make the config state it.
+        from .cyclegan_loader import load_generator
+
+        self.device = device
+        self.direction = direction
+        self.check_range = check_range
+
+        if generator is None:
+            generator = load_generator(framework, direction=direction,
+                                       **loader_kwargs)
+        self.generator = generator.to(device).eval()
+        self.generator.requires_grad_(False)
+
+    def forward(self, data, **kwargs):
+        if self.check_range and (data.min() < -1.5 or data.max() > 1.5):
+            raise ValueError(
+                f'Input range [{data.min():.2f}, {data.max():.2f}] does not '
+                'look like [-1, 1]. The diffusion prior and the generator must '
+                'share a pixel convention; pass check_range: false to override.')
+        # No torch.no_grad() here -- see the class docstring.
+        return self.generator(data)
+
 
 # =============
 # Noise classes

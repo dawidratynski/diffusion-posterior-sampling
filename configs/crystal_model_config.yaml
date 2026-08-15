@@ -1,0 +1,36 @@
+# Diffusion prior for the crystal data.
+#
+# IMPORTANT: this prior is trained on the REAL domain. The project generates
+# realistic measurements from synthetic inputs, so the distribution being
+# sampled from is the real one; the synthetic image is the conditioning target,
+# not the thing being modelled.
+#
+# 160px matches UVCGAN2's shape (3, 160, 160) in the sibling repo -- the prior
+# and the generator operator must share a resolution. 160 is divisible by 32, so
+# the UNet handles it natively; the raw 150px files are resized by the dataset.
+#
+# channel_mult must be given explicitly: create_model only has built-in defaults
+# for 64/128/256/512. "1,1,2,2,4" gives 4 downsamples (160->80->40->20->10).
+image_size: 160
+num_channels: 128
+num_res_blocks: 2
+channel_mult: "1,1,2,2,4"
+
+# learn_sigma: False keeps training to the simple epsilon-MSE objective.
+# Pair with a fixed_* model_var_type in the diffusion config.
+learn_sigma: False
+class_cond: False
+use_checkpoint: False
+
+# 160 // 20 = 8, a downsample factor the network actually has.
+attention_resolutions: "20"
+num_heads: 4
+num_head_channels: 64
+num_heads_upsample: -1
+use_scale_shift_norm: True
+dropout: 0.0
+resblock_updown: True
+use_fp16: False
+use_new_attention_order: False
+
+model_path: models/crystal_real/model_ema_200000.pt
