@@ -71,10 +71,19 @@ def read_gray(path, image_size=DEFAULT_IMAGE_SIZE):
 
 
 def load_dir(root, limit=None):
+    """Sorted PNGs, subsampled by even stride rather than truncation.
+
+    Crops are named "<photo>_sample_<k>", so paths[:limit] collapses onto the
+    alphabetically-first photos: a 500-image reference drawn that way covers 100
+    distinct scenes instead of 500.
+    """
     paths = sorted(glob(os.path.join(root, '**', '*.png'), recursive=True))
     if not paths:
         raise ValueError(f'No PNGs under {root}')
-    return paths[:limit] if limit else paths
+    if limit and limit < len(paths):
+        stride = len(paths) / limit
+        return [paths[int(i * stride)] for i in range(limit)]
+    return paths
 
 
 def summarise_reference(paths, image_size=DEFAULT_IMAGE_SIZE):

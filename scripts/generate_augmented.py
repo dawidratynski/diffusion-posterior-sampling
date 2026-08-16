@@ -126,7 +126,17 @@ def main():
     image_size = model_config['image_size']
     dataset = get_dataset(name='crystal', root=input_root,
                           image_size=image_size, augment=False)
-    n_inputs = len(dataset) if args.limit is None else min(args.limit, len(dataset))
+    # Spread the subset evenly over the sorted file list instead of taking the
+    # first N. Crops are named "<photo>_sample_<k>", so the first N files are
+    # all crops of the alphabetically-first photo(s): --limit 8 gave 2 distinct
+    # scenes, --limit 32 gave 7. Striding gives N distinct scenes and makes small
+    # runs representative rather than a study of one micrograph.
+    if args.limit is not None and args.limit < len(dataset):
+        stride = len(dataset) / args.limit
+        indices = [int(i * stride) for i in range(args.limit)]
+    else:
+        indices = list(range(len(dataset)))
+    n_inputs = len(indices)
     logger.info(f'{n_inputs} inputs from {input_root} (mode={args.mode})')
 
     # The real->synth operator is needed by DPS (it is what DPS inverts) and by
@@ -184,16 +194,16 @@ def main():
         writer.writerow(['output_image', 'source_image', 'method',
                          'sample_index', 'seed'])
 
-        for i in range(n_inputs):
+        for n, i in enumerate(indices):
             source_path = dataset.fpaths[i]
             s = dataset[i].unsqueeze(0).to(device)
             if to_measurement is not None:
                 s = to_measurement(s)
-            logger.info(f'[{i + 1}/{n_inputs}] {os.path.basename(source_path)}')
+            logger.info(f'[{n + 1}/{n_inputs}] {os.path.basename(source_path)}')
 
             for k in range(args.samples_per_input):
                 out = generate(s)
-                fname = f'{i:05d}_{k:02d}.png'
+                fname = f'{n:05d}_{k:02d}.png'
                 plt.imsave(os.path.join(img_dir, fname), clear_color(out))
                 writer.writerow([fname, source_path, args.method, k, args.seed])
             fh.flush()
