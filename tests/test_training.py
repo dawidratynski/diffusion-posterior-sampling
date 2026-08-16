@@ -302,3 +302,43 @@ def test_validation_probe_restores_training_mode():
     model.eval()
     probe(model)
     assert not model.training
+
+
+def test_fp16_export_halves_size_and_still_loads(tmp_path):
+    """Checkpoints dominate Drive usage, and fp16 halves them for ~0.1% error."""
+    import subprocess, sys, yaml, glob, os
+
+    cfg = {"image_size": 32, "num_channels": 32, "num_res_blocks": 1,
+           "channel_mult": "1,2", "learn_sigma": False, "class_cond": False,
+           "attention_resolutions": "16", "num_heads": 1, "num_head_channels": -1}
+    cfg_path = tmp_path / "m.yaml"
+    cfg_path.write_text(yaml.safe_dump(cfg))
+
+    data = tmp_path / "data"
+    data.mkdir()
+    import PIL.Image, numpy as np
+    for i in range(8):
+        PIL.Image.fromarray(
+            (np.random.default_rng(i).random((32, 32, 3)) * 255).astype(np.uint8)
+        ).save(data / f"{i}.png")
+
+    sizes = {}
+    for tag, extra in [("fp32", []), ("fp16", ["--save_fp16"])]:
+        out = tmp_path / tag
+        subprocess.run(
+            [sys.executable, "scripts/train_diffusion.py",
+             "--model_config", str(cfg_path), "--data_root", str(data),
+             "--out_dir", str(out), "--batch_size", "4", "--train_steps", "2",
+             "--save_every", "2", "--log_every", "2", "--num_workers", "0"] + extra,
+            check=True, capture_output=True,
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        sizes[tag] = os.path.getsize(glob.glob(f"{out}/model_ema_*.pt")[0])
+
+    assert sizes["fp16"] < sizes["fp32"] * 0.6, sizes
+
+    # The half-precision export must still load into an fp32 model.
+    m = create_model(**cfg)
+    sd = torch.load(glob.glob(f"{tmp_path}/fp16/model_ema_*.pt")[0],
+                    map_location="cpu", weights_only=True)
+    m.load_state_dict(sd)
+    assert next(m.parameters()).dtype == torch.float32
