@@ -164,7 +164,18 @@ class SpectralIdealizer(nn.Module):
          at radius <= 3, measured on the dataset),
       2. peak sharpening `F <- F * (|F|/max|F|)^gamma`, which raises coherent
          lattice peaks above the incoherent floor -- gamma=0 is the identity,
-         larger gamma drives the output toward perfect periodicity,
+         larger gamma drives the output toward perfect periodicity. gamma is
+         calibrated so the output's peak prominence matches the SYNTH domain,
+         which is what a real G_{R->S} emits; measured on the real val split:
+
+             gamma      0.0    0.15   0.25   0.40   0.60    1.00
+             prominence 987    2433   4134   9496   31960   243547
+             synth domain median: 12197
+
+         0.4 lands closest. The original 1.0 overshot by 20x, making the
+         stand-in far harsher than the operator it stands in for -- and it also
+         started to disturb the lattice itself (median spacing error 0.023 at
+         gamma 1.0 versus 0.000 at 0.4),
       3. renormalisation to the synthetic domain's intensity statistics.
 
     Purpose: end-to-end runs before UVCGAN weights exist. It needs no training,
@@ -177,7 +188,7 @@ class SpectralIdealizer(nn.Module):
     NOT a substitute for the trained model in any reported result.
     '''
 
-    def __init__(self, gamma: float = 1.0, min_period: float = 4.0,
+    def __init__(self, gamma: float = 0.4, min_period: float = 4.0,
                  max_period: float = 37.5, target_mean: float = 0.47,
                  target_std: float = 0.38, softness: float = 1.5):
         super().__init__()

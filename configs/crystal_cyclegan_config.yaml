@@ -15,9 +15,19 @@
 conditioning:
   method: ps
   params:
-    # DPS is very sensitive to this. Sweep it before comparing against the
-    # GAN baseline -- 0.3 is the FFHQ default, not a tuned value for this task.
-    scale: 0.3
+    # Tuned, not inherited: swept over {0.3, 1.0, 2.0, 3.0} on 24 distinct
+    # photos against an 8k-step prior with the spectral stand-in operator.
+    #
+    #   scale        0.3     1.0     2.0     3.0
+    #   spacing err  .019    .007    .000    .000   (floor is ~0)
+    #   diversity    .136    .182    .150    .112   <- peaks here
+    #   spectrum d   .162    .167    .228    .211
+    #
+    # Label validity is already at the measurement floor by 1.0, so 2.0/3.0 buy
+    # nothing there while costing up to 39% of the diversity that is DPS's whole
+    # advantage over a deterministic generator. Re-sweep once the real UVCGAN
+    # operator replaces the stand-in: the optimum depends on the operator.
+    scale: 1.0
 
 data:
   name: crystal
@@ -33,6 +43,10 @@ measurement:
     # real -> synth. This is the operator DPS inverts; the imperfections it
     # discards are exactly what the R prior fills back in.
     direction: ba
+    # Calibrated so the stand-in's output prominence matches the synth domain
+    # (~12k) rather than overshooting it 20x. See SpectralIdealizer's docstring.
+    # Ignored once framework: uvcgan2 replaces the stand-in.
+    gamma: 0.4
 
   noise:
     # The synthetic conditioning target is known exactly -- there is no

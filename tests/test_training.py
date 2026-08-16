@@ -245,3 +245,60 @@ def test_attention_block_honours_use_checkpoint():
         unet_mod.checkpoint = real
 
     assert calls == [False, True], f"flag not forwarded: {calls}"
+
+
+def test_validation_probe_is_deterministic():
+    """Successive calls must differ only by the model, never by the noise draw."""
+    from guided_diffusion.train_util import ValidationProbe
+
+    model = create_model(image_size=32, num_channels=32, num_res_blocks=1,
+                         channel_mult="1,2", learn_sigma=False,
+                         attention_resolutions="16", num_heads=1,
+                         num_head_channels=-1)
+    tr = DiffusionTrainer("linear", 1000, DEVICE)
+    x = torch.randn(4, 3, 32, 32).clamp(-1, 1)
+
+    probe = ValidationProbe(tr, x, timesteps=(50, 500))
+    a, b = probe(model), probe(model)
+    assert a == b, f"probe is not deterministic: {a} vs {b}"
+    assert set(a) == {50, 500}
+
+
+def test_validation_probe_separates_timesteps():
+    """High t is trivially easy; that is why the uniform-t average misleads."""
+    from guided_diffusion.train_util import ValidationProbe
+
+    model = create_model(image_size=32, num_channels=32, num_res_blocks=1,
+                         channel_mult="1,2", learn_sigma=False,
+                         attention_resolutions="16", num_heads=1,
+                         num_head_channels=-1)
+    tr = DiffusionTrainer("linear", 1000, DEVICE)
+    x = torch.randn(4, 3, 32, 32).clamp(-1, 1)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    for _ in range(30):
+        opt.zero_grad()
+        tr.loss(model, x).backward()
+        opt.step()
+
+    losses = ValidationProbe(tr, x, timesteps=(25, 900))(model)
+    assert losses[900] < losses[25], (
+        f"high t should be the easy end: t=25 {losses[25]:.4f}, "
+        f"t=900 {losses[900]:.4f}")
+
+
+def test_validation_probe_restores_training_mode():
+    from guided_diffusion.train_util import ValidationProbe
+
+    model = create_model(image_size=32, num_channels=32, num_res_blocks=1,
+                         channel_mult="1,2", learn_sigma=False,
+                         attention_resolutions="16", num_heads=1,
+                         num_head_channels=-1)
+    tr = DiffusionTrainer("linear", 1000, DEVICE)
+    probe = ValidationProbe(tr, torch.randn(2, 3, 32, 32), timesteps=(100,))
+
+    model.train()
+    probe(model)
+    assert model.training, "probe left the model in eval mode"
+    model.eval()
+    probe(model)
+    assert not model.training

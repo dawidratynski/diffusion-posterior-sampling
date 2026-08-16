@@ -30,7 +30,7 @@ import yaml
 from torch.utils.data import DataLoader
 
 from data.dataloader import get_dataset
-from guided_diffusion.train_util import EMA, DiffusionTrainer
+from guided_diffusion.train_util import EMA, DiffusionTrainer, ValidationProbe
 from guided_diffusion.unet import create_model
 from util.logger import get_logger
 
@@ -69,6 +69,12 @@ def parse_args():
                    help='Bare state_dict (model_ema_*.pt) to initialise from, '
                         'for synth-pretrain -> real-finetune. Unlike --resume '
                         'this starts the step counter and optimiser fresh.')
+    p.add_argument('--val_root', type=str, default=None,
+                   help='Held-out images for the per-timestep validation probe. '
+                        'The running training loss plateaus long before quality '
+                        'does, so without this there is no stopping signal.')
+    p.add_argument('--val_every', type=int, default=1000)
+    p.add_argument('--val_batch', type=int, default=16)
     p.add_argument('--no_augment', action='store_true')
     return p.parse_args()
 
@@ -125,6 +131,19 @@ def main():
                         pin_memory=(device.type == 'cuda'))
 
     trainer = DiffusionTrainer(args.noise_schedule, args.diffusion_steps, device)
+
+    probe = None
+    if args.val_root:
+        val_ds = get_dataset(name=args.dataset, root=args.val_root,
+                             image_size=image_size, augment=False)
+        # Strided, not the first N: crops are named "<photo>_sample_<k>", so
+        # truncating would evaluate several crops of one or two photos.
+        stride = len(val_ds) / min(args.val_batch, len(val_ds))
+        idx = [int(i * stride) for i in range(min(args.val_batch, len(val_ds)))]
+        val_x = torch.stack([val_ds[i] for i in idx]).to(device)
+        probe = ValidationProbe(trainer, val_x)
+        logger.info(f'Validation probe: {len(idx)} held-out images from '
+                    f'{args.val_root}, timesteps {probe.timesteps}')
     ema = EMA(model, args.ema_rate)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
                             weight_decay=args.weight_decay)
@@ -160,9 +179,17 @@ def main():
                    os.path.join(args.out_dir, f'model_ema_{step:06d}.pt'))
         logger.info(f'Saved checkpoint at step {step}')
 
+    def run_probe(step):
+        # On the EMA weights, which are what gets exported and sampled from.
+        losses = probe(ema.ema)
+        parts = '  '.join(f't={t}: {v:.4f}' for t, v in losses.items())
+        logger.info(f'  val @ step {step}   {parts}')
+
     model.train()
     data = infinite(loader)
     running, t0 = 0.0, time.time()
+    if probe is not None:
+        run_probe(start_step)   # baseline to compare later probes against
 
     for step in range(start_step, args.train_steps):
         x = next(data).to(device, non_blocking=True)
@@ -187,6 +214,10 @@ def main():
                         f'ema_decay {ema.current_decay():.5f}  '
                         f'{rate:.2f} it/s')
             running, t0 = 0.0, time.time()
+
+        if probe is not None and (step + 1) % args.val_every == 0:
+            run_probe(step + 1)
+            t0 = time.time()   # do not bill probe time to the it/s estimate
 
         if (step + 1) % args.save_every == 0:
             save(step + 1)

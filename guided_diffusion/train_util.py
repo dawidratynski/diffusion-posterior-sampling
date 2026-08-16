@@ -73,6 +73,49 @@ class DiffusionTrainer:
         return torch.nn.functional.mse_loss(eps_pred, noise)
 
 
+class ValidationProbe:
+    '''Per-timestep loss on a fixed held-out batch.
+
+    The training loss averages over uniformly sampled t, and high-t steps -- where
+    x_t is nearly pure noise, so predicting eps is close to returning the input --
+    are trivially easy and saturate within a few hundred updates. The average is
+    dominated by them and therefore plateaus long before the model stops
+    improving: on this dataset it flattened at ~0.015 by step 500 and drifted only
+    to ~0.012 by step 2000, which says almost nothing about sample quality.
+
+    Fixing the batch, the noise and the timesteps makes successive evaluations
+    differ only by the model, so these are comparable across steps in a way the
+    running training loss is not. Read the LOW t values: they keep falling after
+    the average has flattened, and they govern perceptual quality.
+
+    Evaluate this on the EMA weights, since those are what get exported.
+    '''
+
+    def __init__(self, trainer, images: torch.Tensor,
+                 timesteps=(25, 100, 400, 900), seed: int = 0):
+        self.trainer = trainer
+        self.images = images
+        self.timesteps = tuple(timesteps)
+        g = torch.Generator().manual_seed(seed)
+        self.noise = torch.randn(images.shape, generator=g).to(images.device)
+
+    @torch.no_grad()
+    def __call__(self, model) -> dict:
+        was_training = model.training
+        model.eval()
+        losses = {}
+        for t_val in self.timesteps:
+            t = torch.full((self.images.shape[0],), t_val,
+                           device=self.images.device, dtype=torch.long)
+            x_t = self.trainer.q_sample(self.images, t, self.noise)
+            eps_pred = model(x_t, t)
+            losses[t_val] = torch.nn.functional.mse_loss(
+                eps_pred, self.noise).item()
+        if was_training:
+            model.train()
+        return losses
+
+
 class EMA:
     '''Exponential moving average of model weights, with decay warmup.
 
