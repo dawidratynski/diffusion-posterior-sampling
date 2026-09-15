@@ -15,19 +15,25 @@
 conditioning:
   method: ps
   params:
-    # Tuned, not inherited: swept over {0.3, 1.0, 2.0, 3.0} on 24 distinct
-    # photos against an 8k-step prior with the spectral stand-in operator.
+    # Tuned on the FINAL prior (synth-pretrained + real-finetuned) with the
+    # gamma=0.4 stand-in operator at a 250-step schedule, over 24 distinct
+    # photos x 2 variants. Re-tune when the real UVCGAN operator lands: the
+    # optimum depends on both the operator and the prior.
     #
-    #   scale        0.3     1.0     2.0     3.0
-    #   spacing err  .019    .007    .000    .000   (floor is ~0)
-    #   diversity    .136    .182    .150    .112   <- peaks here
-    #   spectrum d   .162    .167    .228    .211
+    #   scale          1.0     1.5     2.0
+    #   spacing err    .000    .000    .000    (all at the measurement floor)
+    #   signature err  .027    .022    .018
+    #   prominence      809     856    1193    <- real target 1537
+    #   diversity      .412    .347    .243    <- see below
+    #   NN dist       1.139   1.125   1.129    (floor 1.113; all clear)
     #
-    # Label validity is already at the measurement floor by 1.0, so 2.0/3.0 buy
-    # nothing there while costing up to 39% of the diversity that is DPS's whole
-    # advantage over a deterministic generator. Re-sweep once the real UVCGAN
-    # operator replaces the stand-in: the optimum depends on the operator.
-    scale: 1.0
+    # 2.0 chosen: closest to the real prominence target, best label validity,
+    # and judged closest to the reference images by eye. Its lower diversity is
+    # not a cost -- calibration shows two crops of the SAME real photo differ by
+    # 0.088 RMSE and two DIFFERENT real photos by 0.144, so 0.243 is already
+    # 1.7x the real photo-to-photo spread. Scale 1.0's 0.412 is over-dispersion,
+    # consistent with its prominence sitting 47% below real.
+    scale: 2.0
 
 data:
   name: crystal

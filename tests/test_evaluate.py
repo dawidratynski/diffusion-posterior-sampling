@@ -195,3 +195,43 @@ def test_read_gray_normalises_size_and_range():
         img = evaluate.read_gray(p, image_size=160)
         assert img.shape == (160, 160)
         assert 0.0 <= img.min() and img.max() <= 1.0
+
+
+def test_stratifies_by_source_lattice_strength(tmp_path):
+    """Errors on references with a barely-detectable lattice measure the metric's
+    limits, not the method's, so they are reported separately."""
+
+    root = tmp_path / "res"
+    (root / "generated").mkdir(parents=True)
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    rng = np.random.default_rng(0)
+
+    rows = []
+    for i in range(8):
+        # First four: clean lattice. Last four: buried in noise.
+        strong = i < 4
+        base = grating(10.0, angle_deg=7 * i)
+        arr = base if strong else np.clip(base * 0.15 + rng.normal(0.5, 0.3, base.shape), 0, 1)
+        src = src_dir / f"s{i}.png"
+        write_png(src, arr)
+        # Generated output preserves the lattice in both cases.
+        write_png(root / "generated" / f"{i:05d}_00.png",
+                  grating(10.0, angle_deg=7 * i, noise=0.2, seed=i))
+        rows.append([f"{i:05d}_00.png", str(src), "dps", 0, 0])
+
+    with open(root / "manifest.csv", "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["output_image", "source_image", "method", "sample_index", "seed"])
+        w.writerows(rows)
+
+    records = evaluate.evaluate_result_dir(root)
+    proms = [r["src_prominence"] for r in records]
+    thr = np.median(proms)
+    strong = [r for r in records if r["src_prominence"] >= thr]
+    weak = [r for r in records if r["src_prominence"] < thr]
+
+    assert len(strong) == 4 and len(weak) == 4
+    # The clean references must be separable from the noisy ones by prominence.
+    assert min(r["src_prominence"] for r in strong) > max(
+        r["src_prominence"] for r in weak)

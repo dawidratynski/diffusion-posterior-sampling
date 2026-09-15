@@ -306,7 +306,12 @@ def test_validation_probe_restores_training_mode():
 
 def test_fp16_export_halves_size_and_still_loads(tmp_path):
     """Checkpoints dominate Drive usage, and fp16 halves them for ~0.1% error."""
-    import subprocess, sys, yaml, glob, os
+    import glob
+    import os
+    import subprocess
+    import sys
+
+    import yaml
 
     cfg = {"image_size": 32, "num_channels": 32, "num_res_blocks": 1,
            "channel_mult": "1,2", "learn_sigma": False, "class_cond": False,
@@ -316,7 +321,8 @@ def test_fp16_export_halves_size_and_still_loads(tmp_path):
 
     data = tmp_path / "data"
     data.mkdir()
-    import PIL.Image, numpy as np
+    import numpy as np
+    import PIL.Image
     for i in range(8):
         PIL.Image.fromarray(
             (np.random.default_rng(i).random((32, 32, 3)) * 255).astype(np.uint8)

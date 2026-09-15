@@ -262,8 +262,24 @@ def main():
         n = min(len(r['_profile']) for r in records)
         mean_profile = np.mean([r['_profile'][:n] for r in records], axis=0)
 
+        # Split by how strong the SOURCE lattice is. Where the reference is so
+        # noisy that the lattice is barely detectable by eye, the "true" spacing
+        # is itself uncertain, so a large error there measures the metric's
+        # limits rather than the method's. Reporting both keeps that honest.
+        src_prom = [r['src_prominence'] for r in records]
+        thr = float(np.median(src_prom))
+        strong = [r for r in records if r['src_prominence'] >= thr]
+        weak = [r for r in records if r['src_prominence'] < thr]
+
         summary = {
             'result_dir': result_dir,
+            'src_prom_threshold': thr,
+            'spacing_err_strong': float(np.nanmedian(
+                [r['spacing_rel_error'] for r in strong])) if strong else None,
+            'spacing_err_strong_p90': float(np.nanpercentile(
+                [r['spacing_rel_error'] for r in strong], 90)) if strong else None,
+            'spacing_err_weak': float(np.nanmedian(
+                [r['spacing_rel_error'] for r in weak])) if weak else None,
             'method': method,
             'n_images': len(records),
             'n_sources': len({r['source_image'] for r in records}),
@@ -317,6 +333,11 @@ def main():
     row('spacing rel. error (p90)', 'spacing_err_p90', note='lower better')
     row('lattice signature error', 'signature_err_median',
         note='all peaks, not just the top one')
+    row('  strong-lattice refs (median)', 'spacing_err_strong',
+        note='the trustworthy half')
+    row('  strong-lattice refs (p90)', 'spacing_err_strong_p90')
+    row('  weak-lattice refs (median)', 'spacing_err_weak',
+        note='ground truth itself is uncertain here')
     row('angle error deg (median)', 'angle_err_median', '{:.2f}', 'lower better')
     print('-- realism '.ljust(width, '-'))
     row('spectrum dist to real', 'spectrum_dist_to_real', note='lower better')

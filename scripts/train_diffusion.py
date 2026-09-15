@@ -81,7 +81,12 @@ def parse_args():
                         'Each is 4 bytes/param -- 330 MB at 82M params -- so a '
                         '40k-step run saving every 2000 writes 6.6 GB. Use a '
                         'small N for a pretrain whose intermediates you do not '
-                        'need; keep all for a finetune you must sweep over.')
+                        'need; keep all for a finetune you must sweep over. '
+                        'NOTE on Google Drive: deletion moves files to the trash '
+                        'rather than freeing quota, so a long run still needs the '
+                        'trash emptied periodically. Raising --save_every is the '
+                        'cheaper lever -- it is independent of --val_every, so '
+                        'you can probe often and save rarely.')
     p.add_argument('--val_root', type=str, default=None,
                    help='Held-out images for the per-timestep validation probe. '
                         'The running training loss plateaus long before quality '
