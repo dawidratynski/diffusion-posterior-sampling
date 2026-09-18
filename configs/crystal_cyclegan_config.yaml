@@ -43,9 +43,11 @@ data:
 measurement:
   operator:
     name: cyclegan
-    # 'stub' lets the whole pipeline run before real weights exist.
-    # Switch to framework: uvcgan2 + path: <uvcgan2 output dir> when they land.
-    framework: stub
+    # The analytic stand-in. Overridden per-run by generate_augmented.py's
+    # --dps_framework / --rs_framework, which is how the 3-model comparison
+    # selects operators -- so this value is only the fallback for direct
+    # invocations, never what a comparison run silently inherits.
+    framework: spectral
     # real -> synth. This is the operator DPS inverts; the imperfections it
     # discards are exactly what the R prior fills back in.
     direction: ba

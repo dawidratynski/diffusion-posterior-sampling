@@ -69,8 +69,11 @@ class CrystalDataset(VisionDataset):
     Args:
         root: directory of PNGs, searched recursively.
         image_size: target resolution. Must match the UVCGAN2 generator.
-        augment: random flips + 90-degree rotations. The structure is a lattice,
-            so these are label-preserving. Use for training, not for evaluation.
+        augment: random horizontal and vertical flips (the group {I, H, V, HV}).
+            Label-preserving for a lattice. Rotation diversity already comes
+            from the extraction pipeline, which crops at a random angle, so this
+            only adds the reflections that cropping does not produce. Use for
+            training, not for evaluation.
         transforms: applied after the resize. Defaults to ToTensor + Normalize
             to [-1, 1].
     '''

@@ -53,9 +53,7 @@ EOF
 sed "s/^timestep_respacing:.*/timestep_respacing: $RESPACING/" \
     configs/crystal_diffusion_config.yaml > "$WORK/diffusion.yaml"
 
-# Real operator stand-in: analytic, untrained, differentiable.
-sed -e 's/^    framework: stub/    framework: spectral/' \
-    -e "s|^  root:.*|  root: $DATASET/real/val|" \
+sed -e "s|^  root:.*|  root: $DATASET/real/val|" \
     configs/crystal_cyclegan_config.yaml > "$WORK/task.yaml"
 
 # --- 1. train the prior on REAL ---------------------------------------------
@@ -107,16 +105,20 @@ assert worst < 0.9, (
 print(f'  OK: worst-case {worst:.4f} < 0.9 (chance is ~1.0)')
 PYEOF
 
-# --- 3. DPS in validate mode -------------------------------------------------
-# y = A(real image); the generated image should recover the reference. Self
-# consistent for the untrained stand-in, unlike generate mode.
-echo; echo "--- [3/5] DPS (validate mode, spectral operator) ---"
+# --- 3. DPS round trip -------------------------------------------------------
+# y = G_RS(real image); the generated image should recover the reference, and
+# the reference is recorded as ground truth so paired metrics apply. The
+# analytic operator plays both roles here (builds y, and DPS inverts it), which
+# is self-consistent and needs no trained weights.
+echo; echo "--- [3/5] DPS (round trip, analytic operator both roles) ---"
 $PY scripts/generate_augmented.py \
     --model_config "$WORK/model_loaded.yaml" \
     --diffusion_config "$WORK/diffusion.yaml" \
     --task_config "$WORK/task.yaml" \
-    --mode validate --reference_root "$DATASET/real/val" \
-    --out_dir "$WORK/results/dps" --method dps \
+    --input_mode roundtrip --real_root "$DATASET/real/val" \
+    --rs_framework spectral \
+    --method dps --dps_framework spectral --label dps_analytic \
+    --out_dir "$WORK/results/dps" \
     --samples_per_input $VARIANTS --limit $N_IMAGES 2>&1 \
     | { grep -vE '^[[:space:]]*[0-9]+%|it/s\]$' || true; }
 

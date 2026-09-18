@@ -235,3 +235,132 @@ def test_stratifies_by_source_lattice_strength(tmp_path):
     # The clean references must be separable from the noisy ones by prominence.
     assert min(r["src_prominence"] for r in strong) > max(
         r["src_prominence"] for r in weak)
+
+
+# ------------------------------------------------ round trip / 3-model ----
+
+def build_roundtrip_dir(tmp_path, name, label, degrade, n_sources=4):
+    """A round-trip result dir: ground_truth present, so paired metrics apply."""
+    root = tmp_path / name
+    (root / "generated").mkdir(parents=True)
+    src_dir = tmp_path / "rt_sources"
+    src_dir.mkdir(exist_ok=True)
+
+    rows = []
+    for i in range(n_sources):
+        truth = grating(9.0 + i, angle_deg=11 * i, noise=0.05, seed=i)
+        src_path = src_dir / f"real_{i}.png"
+        write_png(src_path, truth)
+        out = f"{i:05d}_00.png"
+        write_png(root / "generated" / out, np.clip(truth + degrade(i), 0, 1))
+        rows.append([out, str(src_path), str(src_path), f"{i:05d}.png",
+                     label, "dps", "spectral", "spectral", 0, 0])
+
+    with open(root / "manifest.csv", "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["output_image", "source_image", "ground_truth",
+                    "measurement_image", "label", "method", "dps_framework",
+                    "rs_framework", "sample_index", "seed"])
+        w.writerows(rows)
+    return root
+
+
+def test_paired_metrics_appear_only_with_ground_truth(tmp_path):
+    """Paired metrics are meaningless in the synth direction and must be absent.
+
+    There is no single correct realistic image for a given synthetic input, so
+    scoring against one would punish a method for being a valid sample.
+    """
+    rng = np.random.default_rng(0)
+    rt = evaluate.evaluate_result_dir(
+        build_roundtrip_dir(tmp_path, "rt", "dps_analytic",
+                            lambda i: rng.normal(0, 0.05, (N, N))))
+    assert all("psnr" in r and "ssim" in r for r in rt)
+
+    synth = evaluate.evaluate_result_dir(
+        build_result_dir(tmp_path, "sy", "dps", lambda p: p))
+    assert all("psnr" not in r and "ssim" not in r for r in synth)
+
+
+def test_paired_metrics_rank_a_better_reconstruction_higher(tmp_path):
+    rng = np.random.default_rng(0)
+    good = evaluate.evaluate_result_dir(
+        build_roundtrip_dir(tmp_path, "good", "a",
+                            lambda i: rng.normal(0, 0.02, (N, N))))
+    bad = evaluate.evaluate_result_dir(
+        build_roundtrip_dir(tmp_path, "bad", "b",
+                            lambda i: rng.normal(0, 0.25, (N, N))))
+    assert np.median([r["psnr"] for r in good]) > np.median(
+        [r["psnr"] for r in bad])
+    assert np.median([r["ssim"] for r in good]) > np.median(
+        [r["ssim"] for r in bad])
+
+
+def test_label_column_names_the_model(tmp_path):
+    """Two DPS variants share method='dps'; the label is what distinguishes them."""
+    recs = evaluate.evaluate_result_dir(
+        build_roundtrip_dir(tmp_path, "lab", "dps_uvcgan", lambda i: 0.0))
+    assert all(r["label"] == "dps_uvcgan" for r in recs)
+    assert all(r["method"] == "dps" for r in recs)
+
+
+def test_missing_ground_truth_file_is_an_explicit_error(tmp_path):
+    root = build_roundtrip_dir(tmp_path, "gone", "x", lambda i: 0.0)
+    (tmp_path / "rt_sources" / "real_0.png").unlink()
+    with pytest.raises(FileNotFoundError, match="ground_truth"):
+        evaluate.evaluate_result_dir(root)
+
+
+def test_reference_excludes_the_images_being_scored(tmp_path):
+    """Round-trip sources come from the same split as the realism reference, so
+    without exclusion a model is scored against a distribution containing the
+    very images it reconstructed."""
+    ref_dir = tmp_path / "real_val"
+    ref_dir.mkdir()
+    paths = []
+    for i in range(10):
+        p = ref_dir / f"{i}_sample_0.png"
+        write_png(p, grating(9.0 + i * 0.5, angle_deg=7 * i))
+        paths.append(str(p))
+
+    root = build_roundtrip_dir(tmp_path, "rt", "m", lambda i: 0.0, n_sources=4)
+    # Point the manifest's ground truths at the first 3 reference images.
+    with open(root / "manifest.csv") as fh:
+        rows = list(csv.DictReader(fh))
+    for row, p in zip(rows, paths[:3]):
+        row["source_image"] = p
+        row["ground_truth"] = p
+    with open(root / "manifest.csv", "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+
+    excluded = evaluate.collect_evaluated_sources([str(root)])
+    kept = evaluate.load_dir(str(ref_dir), exclude=excluded)
+
+    assert len(kept) == 7, f"expected 3 excluded, got {10 - len(kept)}"
+    assert not ({os.path.abspath(p) for p in kept} & excluded)
+
+
+def test_exclusion_keeps_the_reference_at_full_size(tmp_path):
+    """Exclusion happens before striding, so a --limit_reference of N still
+    yields N images rather than N minus the overlap."""
+    ref_dir = tmp_path / "vals"
+    ref_dir.mkdir()
+    for i in range(20):
+        write_png(ref_dir / f"{i:03d}_sample_0.png", grating(10.0 + i * 0.2))
+    excluded = {os.path.abspath(str(ref_dir / "000_sample_0.png"))}
+
+    assert len(evaluate.load_dir(str(ref_dir), limit=8, exclude=excluded)) == 8
+
+
+def test_synth_mode_excludes_nothing_from_a_real_reference(tmp_path):
+    """Synthetic sources never appear in a real reference."""
+    root = build_result_dir(tmp_path, "sy", "dps", lambda p: p)
+    ref_dir = tmp_path / "real"
+    ref_dir.mkdir()
+    for i in range(6):
+        write_png(ref_dir / f"{i}_sample_0.png", grating(11.0 + i))
+
+    excluded = evaluate.collect_evaluated_sources([str(root)])
+    assert len(evaluate.load_dir(str(ref_dir), exclude=excluded)) == 6

@@ -49,10 +49,51 @@ def clear_color(x):
 
 
 def normalize_np(img):
-    """ Normalize img in arbitrary range to [0, 1] """
-    img -= np.min(img)
-    img /= np.max(img)
-    return img
+    """Normalise img in arbitrary range to [0, 1]. Returns a NEW array.
+
+    The in-place original (`img -= ...; img /= ...`) mutated the caller's data.
+    That is not academic: `clear_color` reaches the array via `.numpy()`, which
+    on CPU shares storage with the tensor, so saving a tensor silently rewrote
+    it. In generate_augmented.py the measurement was saved and then used for
+    sampling, so every CPU run conditioned DPS on a min-max-rescaled `y` while
+    the operator still produced [-1, 1] -- the data-consistency term was
+    comparing incompatible ranges. (CUDA was unaffected: `.cpu()` copies.)
+
+    Also guards max == 0, which otherwise divides by zero for a constant image.
+    """
+    img = np.array(img, copy=True)
+    img = img - np.min(img)
+    hi = np.max(img)
+    return img / hi if hi > 0 else img
+
+
+def to_display(x):
+    """[-1, 1] tensor -> HxWx3 float array in [0, 1], via a FIXED affine map.
+
+    Use this, not `clear_color`, for any image that will later be measured.
+
+    `clear_color` min-max normalises PER IMAGE, which rescales every output to
+    span the full range. That destroys exactly the information several metrics
+    depend on:
+
+      - brightness and contrast differences between outputs disappear, so
+        diversity is understated;
+      - a generated PNG is no longer on the same scale as the source PNG it is
+        compared against, so PSNR/SSIM/LPIPS measure a stretch that the model
+        never applied;
+      - it is not what the model produced, so the saved figures are not the
+        result either.
+
+    The dataset maps PNG [0, 1] -> [-1, 1]; this is the exact inverse, so a
+    generated PNG and a dataset PNG are directly comparable.
+    """
+    x = x.detach().cpu()
+    if x.dim() == 4:
+        if x.shape[0] != 1:
+            raise ValueError(f'Expected a single image, got batch {x.shape[0]}')
+        x = x[0]
+    arr = x.permute(1, 2, 0).numpy()
+    return np.clip((arr + 1.0) / 2.0, 0.0, 1.0)
 
 
 def prepare_im(load_dir, image_size, device):

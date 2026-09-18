@@ -7,23 +7,49 @@ quietly degrades to unconditional) rather than a crash.
 import numpy as np
 import pytest
 import torch
+from torch import nn
 
 from guided_diffusion.condition_methods import get_conditioning_method
-from guided_diffusion.cyclegan_loader import StubGenerator, load_generator
 from guided_diffusion.measurements import get_noise, get_operator
 
 DEVICE = torch.device("cpu")
 SIZE = 160  # must match UVCGAN2's (3, 160, 160)
 
 
-def make_op(direction="ba", **kw):
+class FakeGenerator(nn.Module):
+    """A throwaway generator for testing the operator contract.
+
+    Deliberately NOT registered as a framework. Its predecessor was, under the
+    name 'stub', and being selectable from a config meant it silently became the
+    operator for a whole run of experiments. A test double that cannot be named
+    in a config cannot do that.
+    """
+
+    def __init__(self, channels: int = 32, seed: int = 0):
+        super().__init__()
+        g = torch.Generator().manual_seed(seed)
+        self.net = nn.Sequential(
+            nn.Conv2d(3, channels, 7, padding=3, padding_mode="reflect"),
+            nn.InstanceNorm2d(channels), nn.ReLU(inplace=True),
+            nn.Conv2d(channels, 3, 7, padding=3, padding_mode="reflect"),
+            nn.Tanh(),
+        )
+        for p in self.net.parameters():
+            with torch.no_grad():
+                p.copy_(torch.empty_like(p).normal_(0.0, 0.05, generator=g))
+
+    def forward(self, x):
+        return self.net(x)
+
+
+def make_op(direction="ba", seed=0, **kw):
     # 'ba' (real->synth) is the DPS operator for this project: DPS inverts its
     # operator, and the goal is generating real-like images from synthetic ones.
-    return get_operator(name="cyclegan", device=DEVICE, framework="stub",
-                        direction=direction, **kw)
+    return get_operator(name="cyclegan", device=DEVICE, direction=direction,
+                        generator=FakeGenerator(seed=seed), **kw)
 
 
-def test_stub_shape_and_range():
+def test_operator_shape_and_range():
     op = make_op()
     x = torch.rand(2, 3, SIZE, SIZE) * 2 - 1
     y = op.forward(x)
@@ -57,11 +83,10 @@ def test_generator_params_frozen_but_graph_intact():
     assert op.forward(x).requires_grad, "forward ran without grad tracking"
 
 
-def test_directions_differ():
-    ab = load_generator("stub", direction="ab")
-    ba = load_generator("stub", direction="ba")
-    x = torch.rand(1, 3, 32, 32) * 2 - 1
-    assert not torch.allclose(ab(x), ba(x))
+def test_direction_is_recorded_on_the_operator():
+    """Which way an operator maps is the thing most easily got backwards."""
+    assert make_op(direction="ba").direction == "ba"
+    assert make_op(direction="ab").direction == "ab"
 
 
 def test_range_check_rejects_0_1_input():
@@ -72,7 +97,7 @@ def test_range_check_rejects_0_1_input():
 
 
 def test_injected_generator_overrides_loader():
-    gen = StubGenerator(seed=123)
+    gen = FakeGenerator(seed=123)
     op = get_operator(name="cyclegan", device=DEVICE, direction="ba", generator=gen)
     assert op.generator is gen
 
@@ -80,7 +105,7 @@ def test_injected_generator_overrides_loader():
 def test_direction_must_be_stated_explicitly():
     """Wrong direction still runs and still makes images -- just the wrong ones."""
     with pytest.raises(TypeError, match="direction"):
-        get_operator(name="cyclegan", device=DEVICE, framework="stub")
+        get_operator(name="cyclegan", device=DEVICE, framework="spectral")
 
 
 def test_clean_noise_supported_for_known_measurement():
@@ -169,3 +194,36 @@ def test_spectral_rejects_wrong_direction():
     with pytest.raises(ValueError, match="real -> synth"):
         get_operator(name="cyclegan", device=DEVICE, framework="spectral",
                      direction="ab")
+
+
+def test_foreign_framework_params_are_rejected():
+    """The silent failure that invalidated a whole run of results.
+
+    A config naming one framework while carrying another's settings used to load
+    fine, with the foreign settings discarded into **kwargs -- so a run could be
+    reported as using an operator it never touched. Every loader now declares its
+    parameters explicitly and unknown ones raise.
+    """
+    with pytest.raises(TypeError, match="does not accept"):
+        get_operator(name="cyclegan", device=DEVICE, framework="spectral",
+                     direction="ba", ngf=64)
+
+    # A parameter the loader really does own must still be accepted, and must
+    # actually reach the constructed operator rather than being defaulted.
+    op = get_operator(name="cyclegan", device=DEVICE, framework="spectral",
+                      direction="ba", gamma=0.25)
+    assert op.generator.gamma == 0.25
+
+
+def test_no_placeholder_framework_is_registered():
+    """Nothing selectable from a config may be a non-operator.
+
+    A registered random-weight placeholder became the operator for a whole run
+    of experiments purely by being the config default. Frameworks must all be
+    real translation models or the analytic one.
+    """
+    from guided_diffusion.cyclegan_loader import __LOADER__
+
+    assert set(__LOADER__) == {"uvcgan2", "cyclegan_resnet", "torchscript",
+                               "spectral"}, (
+        f"unexpected framework registered: {sorted(__LOADER__)}")

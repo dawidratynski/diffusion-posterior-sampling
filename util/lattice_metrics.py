@@ -181,20 +181,44 @@ def lattice_signature(img: np.ndarray, k: int = 4, pad_factor: int = 4,
     return top_k_peaks(ps, k=k, pad_factor=pad_factor, **kwargs)
 
 
+def _reciprocal_vector(peak: dict) -> np.ndarray:
+    '''The peak's position in reciprocal space, in cycles per image.
+
+    Angle is reported mod 180, so this is the representative in the upper half
+    plane -- consistent between any two peaks being compared, and unambiguous
+    because top_k_peaks suppresses each peak's centrosymmetric mirror.
+    '''
+    theta = np.radians(peak['angle_deg'])
+    r = peak['radius_px']
+    return np.array([r * np.cos(theta), r * np.sin(theta)])
+
+
 def signature_distance(sig_a: list, sig_b: list) -> float:
-    '''Mean relative spacing mismatch after greedily matching peaks by angle.
+    '''Mean relative spacing mismatch after matching peaks between two lattices.
 
     Compares whole reciprocal lattices rather than one vector, so distortion of
     a secondary lattice direction is visible.
+
+    Peaks are matched by distance in RECIPROCAL SPACE, not by angle alone. A
+    lattice direction contributes a fundamental *and its harmonics at the same
+    angle* -- a square-wave-like profile gives peaks at, say, 24.1 px, 8.0 px and
+    4.8 px all at 20 degrees -- so angle alone cannot tell which is which, and
+    the pairing would fall out of list order. Reciprocal-space distance separates
+    them by radius while still keeping different directions apart.
+
+    This does not mask genuine drift: a fundamental that shifted even 50% is far
+    closer to the source fundamental than to its own 3rd harmonic.
     '''
     if not sig_a or not sig_b:
         return np.nan
     remaining = list(sig_b)
     errors = []
     for pa in sig_a:
+        va = _reciprocal_vector(pa)
+        scale = np.linalg.norm(va) or 1.0
         best = min(remaining,
-                   key=lambda pb: angle_difference(pa['angle_deg'],
-                                                   pb['angle_deg']))
+                   key=lambda pb: float(
+                       np.linalg.norm(_reciprocal_vector(pb) - va) / scale))
         errors.append(spacing_error(best['spacing_px'], pa['spacing_px']))
         if len(remaining) > 1:
             remaining.remove(best)

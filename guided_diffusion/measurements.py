@@ -231,8 +231,12 @@ class CycleGanOperator(NonLinearOperator):
     Args:
         device: torch device.
         framework: which loader to use -- 'uvcgan2', 'cyclegan_resnet',
-            'torchscript', or 'stub' for development without real weights.
-        direction: 'ab' (synth->real, the operator) or 'ba'.
+            'torchscript' for trained weights, or 'spectral' for the analytic
+            operator. No default: a wrong-but-plausible operator produces
+            plausible-but-wrong results, so the caller must say which it means.
+        direction: 'ba' (real->synth) is the DPS operator; 'ab' (synth->real) is
+            the direct-translation baseline. DPS inverts its operator, so the
+            operator direction is the opposite of the mapping being produced.
         generator: an already-built nn.Module; overrides framework loading.
         check_range: assert inputs look like [-1, 1]. A silent convention
             mismatch between the prior and the generator is the single easiest
@@ -240,7 +244,7 @@ class CycleGanOperator(NonLinearOperator):
         loader_kwargs: passed through to the loader (e.g. path=...).
     '''
 
-    def __init__(self, device, direction: str, framework: str = 'stub',
+    def __init__(self, device, direction: str, framework: str | None = None,
                  generator=None, check_range: bool = True, **loader_kwargs):
         # `direction` is deliberately required rather than defaulted: picking the
         # wrong one still runs and still produces images, just answering the
@@ -252,6 +256,11 @@ class CycleGanOperator(NonLinearOperator):
         self.check_range = check_range
 
         if generator is None:
+            if framework is None:
+                raise TypeError(
+                    'CycleGanOperator needs an explicit framework (or an '
+                    'already-built generator). There is no sensible default: '
+                    'the operator decides what the experiment measures.')
             generator = load_generator(framework, direction=direction,
                                        **loader_kwargs)
         self.generator = generator.to(device).eval()

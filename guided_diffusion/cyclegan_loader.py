@@ -1,9 +1,13 @@
 '''Loading CycleGAN-family generators as DPS measurement operators.
 
 Each backend returns a plain `nn.Module` mapping [-1, 1] images to [-1, 1]
-images. Keeping loading separate from the operator itself means the operator can
-be developed and tested against `stub` today and switched to real weights by
-changing one config field.
+images. Keeping loading separate from the operator itself means the analytic
+operator and a trained one are interchangeable at the call site, which is what
+lets the same pipeline evaluate both as DPS operators.
+
+Every registered framework is a real operator. Loaders declare their parameters
+explicitly and reject any others, so a config cannot name one framework while
+carrying another's settings -- see load_generator().
 
 Direction convention throughout: domain A = synth (simulated/ideal),
 domain B = real (electron microscope), matching uvcgan_training/train_crystals.py
@@ -21,6 +25,8 @@ i.e. "a realistic image whose synth-domain projection is my known s". Note the
 DPS operator is `ba` even though the overall S -> R mapping is what is wanted:
 DPS inverts its operator.
 '''
+import inspect
+
 import torch
 from torch import nn
 
@@ -42,11 +48,28 @@ def load_generator(framework: str, direction: str = 'ab', **kwargs) -> nn.Module
                         f"Available: {sorted(__LOADER__)}")
     if direction not in ('ab', 'ba'):
         raise ValueError(f"direction must be 'ab' or 'ba', got {direction!r}")
+
+    # Reject parameters the chosen loader does not accept. Every loader used to
+    # end in **kwargs, so a config carrying another framework's settings loaded
+    # silently with those settings ignored. `framework: stub` alongside
+    # `gamma: 0.4` ran the random-weight stub while looking like a configured
+    # spectral operator, and a whole run of results was attributed to the wrong
+    # operator. Failing loudly is the only way that class of error is visible.
+    sig = inspect.signature(__LOADER__[framework])
+    accepted = {n for n, prm in sig.parameters.items()
+                if prm.kind is not inspect.Parameter.VAR_KEYWORD}
+    unknown = set(kwargs) - accepted
+    if unknown:
+        raise TypeError(
+            f"framework '{framework}' does not accept {sorted(unknown)}; it "
+            f"accepts {sorted(accepted - {'direction'})}. Those parameters "
+            "usually belong to a different framework -- check that the config's "
+            "`framework:` is the operator you meant to use.")
     return __LOADER__[framework](direction=direction, **kwargs)
 
 
 @register_loader('uvcgan2')
-def load_uvcgan2(direction: str, path: str, epoch: int = -1, **kwargs):
+def load_uvcgan2(direction: str, path: str, epoch: int = -1):
     '''Load a UVCGAN2 (LS4GAN) generator.
 
     UVCGAN2 saves a whole model directory (weights *plus* the config needed to
@@ -83,7 +106,7 @@ def load_uvcgan2(direction: str, path: str, epoch: int = -1, **kwargs):
 
 @register_loader('cyclegan_resnet')
 def load_cyclegan_resnet(direction: str, path: str, ngf: int = 64,
-                         n_blocks: int = 9, **kwargs):
+                         n_blocks: int = 9):
     '''Load a junyanz pytorch-CycleGAN-and-pix2pix generator.
 
     That repo saves a bare generator state_dict (`latest_net_G_A.pth`), so the
@@ -109,7 +132,7 @@ def load_cyclegan_resnet(direction: str, path: str, ngf: int = 64,
 
 
 @register_loader('torchscript')
-def load_torchscript(direction: str, path: str, **kwargs):
+def load_torchscript(direction: str, path: str):
     '''Load a TorchScript-traced generator.
 
     The most robust option if whoever trains the GAN can export one: it carries
@@ -119,38 +142,15 @@ def load_torchscript(direction: str, path: str, **kwargs):
     return torch.jit.load(path, map_location='cpu')
 
 
-class StubGenerator(nn.Module):
-    '''Deterministic stand-in with the same contract as a real generator.
-
-    Not a translation model -- it exists so the operator, configs, sampling
-    script and evaluation can be built and tested before real weights arrive.
-    Small, seeded and resolution-agnostic; tanh-bounded to [-1, 1] like a real
-    CycleGAN generator.
-    '''
-
-    def __init__(self, channels: int = 32, seed: int = 0):
-        super().__init__()
-        g = torch.Generator().manual_seed(seed)
-        self.net = nn.Sequential(
-            nn.Conv2d(3, channels, 7, padding=3, padding_mode='reflect'),
-            nn.InstanceNorm2d(channels), nn.ReLU(inplace=True),
-            nn.Conv2d(channels, channels, 3, padding=1, padding_mode='reflect'),
-            nn.InstanceNorm2d(channels), nn.ReLU(inplace=True),
-            nn.Conv2d(channels, 3, 7, padding=3, padding_mode='reflect'),
-            nn.Tanh(),
-        )
-        for p in self.net.parameters():
-            with torch.no_grad():
-                p.copy_(torch.empty_like(p).normal_(0.0, 0.05, generator=g))
-
-    def forward(self, x):
-        return self.net(x)
-
-
-@register_loader('stub')
-def load_stub(direction: str, seed: int = 0, **kwargs):
-    # Different seeds per direction so ab and ba are not accidentally identical.
-    return StubGenerator(seed=seed + (0 if direction == 'ab' else 1))
+# A `stub` framework used to live here: a small randomly-initialised conv net,
+# for exercising the plumbing before any real or analytic operator existed. It
+# was removed because `spectral` supersedes it and it was actively dangerous --
+# being registered and named in the default config, it silently became the
+# operator for a whole run of experiments whose results were then attributed to
+# the spectral operator. A random conv net BLURS the lattice where the intended
+# operator SHARPENS it, so the mix-up inverted the experiment rather than
+# perturbing it. Nothing should need a placeholder operator again; if something
+# does, give it a name that cannot be mistaken for a real one.
 
 
 class SpectralIdealizer(nn.Module):
@@ -231,10 +231,14 @@ class SpectralIdealizer(nn.Module):
 
 
 @register_loader('spectral')
-def load_spectral(direction: str, **kwargs):
+def load_spectral(direction: str, gamma: float = 0.4, min_period: float = 4.0,
+                  max_period: float = 37.5, target_mean: float = 0.47,
+                  target_std: float = 0.38, softness: float = 1.5):
     if direction != 'ba':
         raise ValueError(
             'SpectralIdealizer only models real -> synth (direction: ba). '
             'There is no analytic stand-in for the synth -> real direction; '
             'use the trained generator for the baseline.')
-    return SpectralIdealizer(**kwargs)
+    return SpectralIdealizer(gamma=gamma, min_period=min_period,
+                             max_period=max_period, target_mean=target_mean,
+                             target_std=target_std, softness=softness)

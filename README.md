@@ -276,27 +276,33 @@ Emits realistic images plus `manifest.csv` mapping each output back to its
 source — that mapping is what carries the labels.
 
 ```
-# product: y IS the synthetic image (needs a trained G_{R->S})
+# product: y IS the synthetic image
 uv run python scripts/generate_augmented.py ... \
-    --mode generate --synth_root ../dataset/synth/val \
-    --out_dir ./results/dps --method dps --samples_per_input 4
+    --input_mode synth --synth_root ../dataset/synth/val \
+    --method dps --dps_framework uvcgan2 --uvcgan_path /path/to/model \
+    --out_dir ./results/dps --label dps_uvcgan --samples_per_input 4
 
-# rehearsal: y = A(real image), works with any operator including the stand-in
+# round trip: y = G_RS(real image), and the real image is the ground truth,
+# so PSNR/SSIM/LPIPS apply
 uv run python scripts/generate_augmented.py ... \
-    --mode validate --reference_root ../dataset/real/val \
-    --out_dir ./results/dps --method dps --samples_per_input 4
+    --input_mode roundtrip --real_root ../dataset/real/val \
+    --rs_framework spectral \
+    --method dps --dps_framework spectral \
+    --out_dir ./results/dps --label dps_analytic --samples_per_input 4
 ```
 
-`--mode generate` requires a real trained generator: `y` has to lie in the
-operator's actual output distribution, and the analytic stand-in emits
-sinusoid-like images rather than true synth-domain ones, so the data-consistency
-term would be unsatisfiable by construction. `--mode validate` derives `y` with
-the same operator DPS inverts, so it is self-consistent for any operator.
+The operator is named on the command line, never inherited from the task config.
+`--rs_framework` (which R→S model builds the measurement) is **separate** from
+`--dps_framework` (which operator DPS inverts): the three-model comparison needs
+every model to see the *same* measurement while inverting its own operator.
 
 `--method uvcgan` runs the direct-translation baseline through the same
 interface. It is deterministic, so `--samples_per_input > 1` is rejected rather
 than silently emitting duplicates. Both modes write the same manifest format,
 so `evaluate.py` consumes either.
+
+For the full comparison, drive it with `scripts/run_comparison.py`, which
+enumerates the models, skips those whose weights are missing, and is resumable.
 
 ## Evaluation
 
@@ -358,9 +364,15 @@ This benchmark structurally favours the UVCGAN baseline — `gen_ab` was trained
 with a cycle loss to invert `gen_ba`. Report that caveat; a DPS win here is
 strong, a loss is not damning.
 
-Both configs default to `framework: stub`, a seeded dummy generator so the whole
-pipeline runs before real weights exist. Swap to `framework: uvcgan2` + `path:`
-when they arrive.
+The operator is chosen per run by `generate_augmented.py`'s `--rs_framework` /
+`--dps_framework`, not inherited from the config. This is deliberate: a
+`framework: stub` default once made a randomly-initialised conv net the operator
+for an entire run of experiments whose results were then reported as the
+analytic operator's. A random net *blurs* the lattice where the analytic
+operator *sharpens* it, so the mix-up inverted the experiment rather than
+perturbing it, and nothing in the output revealed it. Frameworks are now all
+real operators, loaders reject parameters belonging to a different framework,
+and the operator under test is named on the command line.
 
 ## Changes to upstream
 

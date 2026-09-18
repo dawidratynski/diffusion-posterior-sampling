@@ -1,45 +1,55 @@
-'''Generate realistic (R-like) images from synthetic inputs with known parameters.
+'''Generate realistic (R-like) images, for the three-way S->R model comparison.
 
-This is the project deliverable: cheap labelled data. Each synthetic input has
-known lattice parameters; each generated output inherits them, so the pair
-(output image, source parameters) becomes a training example for the downstream
-project that lacks real data.
+THE THREE MODELS UNDER TEST
+---------------------------
+All three map a synth-domain image to a realistic one; they differ in how.
 
-Two methods, same interface, so the comparison is apples-to-apples:
+  uvcgan          x = G_{S->R}(s)
+                  Direct translation. Deterministic, so --samples_per_input > 1
+                  is pointless and rejected.
+                  --method uvcgan
 
-  --method dps      x ~ p_R(x) . p(s | G_{R->S}(x))
-                    Diffusion prior on REAL, conditioned so the synth-domain
-                    projection matches the input. Stochastic: --samples_per_input
-                    > 1 gives genuinely different realistic variants of one input.
+  dps + uvcgan    x ~ p_R(x) . p(s | G_{R->S}(x))
+                  DPS with the TRAINED real->synth generator as its operator.
+                  --method dps --dps_framework uvcgan2
 
-  --method uvcgan   x = G_{S->R}(s)
-                    The direct-translation baseline. Deterministic, so
-                    --samples_per_input > 1 is pointless and is rejected.
+  dps + analytic  as above with the analytic SpectralIdealizer as the operator.
+                  The "no trained translation model" ablation.
+                  --method dps --dps_framework spectral
 
-Two modes, because the measurement can come from two places:
+The operator is named on the command line, never inherited silently from the
+task config: which operator ran decides what the experiment measured, and a
+plausible-but-wrong one yields plausible-but-wrong numbers with nothing in the
+output to reveal it.
 
-  --mode generate (--synth_root)
-      y IS the synthetic image. This is the product. It requires a real trained
-      G_{R->S}, because y must lie in the operator's actual output distribution.
+TWO INPUT MODES
+---------------
+  --input_mode synth (--synth_root)
+      y IS a synthetic image. This is the product: cheap labelled data, since
+      each output inherits its source's known lattice parameters.
 
-  --mode validate (--reference_root)
-      y = A(real image), and the real image is recorded as the source. Self
-      consistent for ANY operator, including the untrained `spectral` stand-in,
-      so the full pipeline can be exercised before UVCGAN exists. The generated
-      image should recover the reference it came from.
+  --input_mode roundtrip (--real_root)
+      y = G_{R->S}(real), and the real image is recorded as ground truth, so
+      paired metrics (PSNR/SSIM/LPIPS) become available. Which R->S model builds
+      y is --rs_framework, INDEPENDENT of the operator DPS inverts. That
+      separation is the point: every SR model must see the same y for the
+      comparison to be apples-to-apples, including dps+analytic, whose operator
+      then does not match the y it is given. That mismatch is not a flaw in the
+      experiment -- it is what the ablation measures.
 
-Both modes write the same manifest format, so scripts/evaluate.py consumes
-either without knowing which was used.
+Writes generated/, measurement/ (roundtrip only) and manifest.csv. The manifest
+records, per output: the input whose lattice defines the label, the ground truth
+if any, and the measurement actually fed to the model.
 
     python scripts/generate_augmented.py \
         --model_config configs/crystal_model_config.yaml \
         --diffusion_config configs/crystal_diffusion_config.yaml \
         --task_config configs/crystal_cyclegan_config.yaml \
-        --synth_root /path/to/dataset/synth/val \
-        --out_dir ./results/augmented --method dps --samples_per_input 4
-
-Writes images plus manifest.csv mapping every output back to its source file,
-which is what carries the labels.
+        --input_mode roundtrip --real_root /path/to/dataset/real/val \
+        --rs_framework uvcgan2 --uvcgan_path /path/to/uvcgan_model \
+        --method dps --dps_framework uvcgan2 \
+        --out_dir ./results/rt_dps_uvcgan --label dps_uvcgan \
+        --samples_per_input 4 --limit 50
 '''
 import argparse
 import csv
@@ -55,8 +65,10 @@ from guided_diffusion.condition_methods import get_conditioning_method
 from guided_diffusion.gaussian_diffusion import create_sampler
 from guided_diffusion.measurements import get_noise, get_operator
 from guided_diffusion.unet import create_model
-from util.img_utils import clear_color
+from util.img_utils import to_display
 from util.logger import get_logger
+
+FRAMEWORKS = ('uvcgan2', 'spectral', 'cyclegan_resnet', 'torchscript')
 
 
 def load_yaml(path):
@@ -69,17 +81,34 @@ def parse_args():
     p.add_argument('--model_config', type=str, required=True)
     p.add_argument('--diffusion_config', type=str, required=True)
     p.add_argument('--task_config', type=str, required=True)
-    p.add_argument('--mode', choices=['generate', 'validate'], default='generate')
+
+    p.add_argument('--input_mode', choices=['synth', 'roundtrip'],
+                   default='synth')
     p.add_argument('--synth_root', type=str, default=None,
-                   help='mode=generate: synthetic PNGs used directly as y.')
-    p.add_argument('--reference_root', type=str, default=None,
-                   help='mode=validate: real PNGs; y = A(reference).')
-    p.add_argument('--out_dir', type=str, required=True)
+                   help='input_mode=synth: synthetic PNGs used directly as y.')
+    p.add_argument('--real_root', type=str, default=None,
+                   help='input_mode=roundtrip: real PNGs; y = G_RS(real).')
+    p.add_argument('--rs_framework', choices=FRAMEWORKS, default=None,
+                   help='roundtrip: which real->synth model builds y. Keep this '
+                        'fixed across the models being compared.')
+
     p.add_argument('--method', choices=['dps', 'uvcgan'], default='dps')
+    p.add_argument('--dps_framework', choices=FRAMEWORKS, default=None,
+                   help='dps: which real->synth operator DPS inverts. This is '
+                        'what distinguishes the two DPS variants.')
+    p.add_argument('--uvcgan_path', type=str, default=None,
+                   help='Model directory for any uvcgan2 framework selected '
+                        'above. Applies to both --rs_framework and '
+                        '--dps_framework and to --method uvcgan.')
+
+    p.add_argument('--out_dir', type=str, required=True)
+    p.add_argument('--label', type=str, default=None,
+                   help='Name for this model in the comparison tables. '
+                        'Defaults to method[+dps_framework].')
     p.add_argument('--samples_per_input', type=int, default=1,
                    help='DPS only. >1 exploits the stochasticity a GAN lacks.')
     p.add_argument('--limit', type=int, default=None,
-                   help='Only process the first N synthetic inputs.')
+                   help='Process N inputs, strided across the sorted file list.')
     p.add_argument('--scale', type=float, default=None,
                    help='Override the conditioning scale from the task config.')
     p.add_argument('--seed', type=int, default=0)
@@ -87,31 +116,81 @@ def parse_args():
     return p.parse_args()
 
 
-def main():
-    args = parse_args()
-    logger = get_logger()
-    torch.manual_seed(args.seed)
+def build_operator(measure_cfg, framework, direction, device, uvcgan_path):
+    '''One real->synth (or synth->real) generator, with framework stated.'''
+    cfg = dict(measure_cfg['operator'])
+    cfg['framework'] = framework
+    cfg['direction'] = direction
 
+    # Framework-specific settings in the task config would be rejected by a
+    # different framework's loader, so keep only what this one accepts.
+    if framework != 'spectral':
+        for k in ('gamma', 'min_period', 'max_period', 'target_mean',
+                  'target_std', 'softness'):
+            cfg.pop(k, None)
+    if framework in ('uvcgan2', 'cyclegan_resnet', 'torchscript'):
+        if not uvcgan_path:
+            raise ValueError(
+                f"framework '{framework}' needs weights: pass --uvcgan_path.")
+        if not os.path.exists(uvcgan_path):
+            raise FileNotFoundError(
+                f'--uvcgan_path {uvcgan_path} does not exist. Run '
+                'scripts/probe_uvcgan.py first to check the checkpoint loads.')
+        cfg['path'] = uvcgan_path
+    else:
+        cfg.pop('path', None)
+
+    return get_operator(device=device, **cfg)
+
+
+def validate_args(args):
     if args.method == 'uvcgan' and args.samples_per_input != 1:
         raise ValueError(
             'The uvcgan baseline is deterministic, so --samples_per_input > 1 '
             'would just duplicate identical images. Use --method dps for '
             'multiple variants per input.')
 
-    roots = {'generate': args.synth_root, 'validate': args.reference_root}
-    expected = {'generate': '--synth_root', 'validate': '--reference_root'}
-    input_root = roots[args.mode]
-    if input_root is None:
-        raise ValueError(f'--mode {args.mode} requires {expected[args.mode]}.')
-    if roots[{'generate': 'validate', 'validate': 'generate'}[args.mode]]:
+    roots = {'synth': args.synth_root, 'roundtrip': args.real_root}
+    expected = {'synth': '--synth_root', 'roundtrip': '--real_root'}
+    other = {'synth': 'roundtrip', 'roundtrip': 'synth'}[args.input_mode]
+    if roots[args.input_mode] is None:
         raise ValueError(
-            f'--mode {args.mode} uses {expected[args.mode]}; the other root is '
-            'ignored, which is probably not what you meant.')
+            f'--input_mode {args.input_mode} requires {expected[args.input_mode]}.')
+    if roots[other]:
+        raise ValueError(
+            f'--input_mode {args.input_mode} uses {expected[args.input_mode]}; '
+            f'{expected[other]} would be ignored, which is probably not meant.')
+
+    if args.input_mode == 'roundtrip' and not args.rs_framework:
+        raise ValueError(
+            '--input_mode roundtrip needs --rs_framework: y = G_RS(real), and '
+            'which R->S model builds y must be identical across the models you '
+            'are comparing or the comparison is not like-for-like.')
+    if args.method == 'dps' and not args.dps_framework:
+        raise ValueError(
+            '--method dps needs --dps_framework: the operator DPS inverts is '
+            'what distinguishes the DPS variants, so it is never defaulted.')
+    if args.input_mode == 'synth' and args.rs_framework:
+        raise ValueError(
+            '--rs_framework only applies to --input_mode roundtrip; in synth '
+            'mode the input already is the measurement.')
+
+    return roots[args.input_mode]
+
+
+def main():
+    args = parse_args()
+    logger = get_logger()
+    torch.manual_seed(args.seed)
+
+    input_root = validate_args(args)
+    label = args.label or (
+        args.method if args.method == 'uvcgan'
+        else f'dps_{args.dps_framework}')
 
     device = torch.device(
         args.device if args.device
         else ('cuda' if torch.cuda.is_available() else 'cpu'))
-    logger.info(f'Device: {device} / method: {args.method}')
 
     task_config = load_yaml(args.task_config)
     measure_config = task_config['measurement']
@@ -119,54 +198,60 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     img_dir = os.path.join(args.out_dir, 'generated')
     os.makedirs(img_dir, exist_ok=True)
+    meas_dir = os.path.join(args.out_dir, 'measurement')
+    if args.input_mode == 'roundtrip':
+        os.makedirs(meas_dir, exist_ok=True)
 
-    # The synthetic inputs. image_size must match both the prior and the
-    # generator; taken from the model config so the three cannot drift apart.
     model_config = load_yaml(args.model_config)
     image_size = model_config['image_size']
     dataset = get_dataset(name='crystal', root=input_root,
                           image_size=image_size, augment=False)
     # Spread the subset evenly over the sorted file list instead of taking the
-    # first N. Crops are named "<photo>_sample_<k>", so the first N files are
-    # all crops of the alphabetically-first photo(s): --limit 8 gave 2 distinct
-    # scenes, --limit 32 gave 7. Striding gives N distinct scenes and makes small
-    # runs representative rather than a study of one micrograph.
+    # first N. Crops are named "<photo>_sample_<k>", so the first N files are all
+    # crops of the alphabetically-first photo(s): --limit 8 gave 2 distinct
+    # scenes, --limit 32 gave 7. Striding gives N distinct scenes, and keeps the
+    # subset identical across models so their outputs are directly comparable.
     if args.limit is not None and args.limit < len(dataset):
         stride = len(dataset) / args.limit
         indices = [int(i * stride) for i in range(args.limit)]
     else:
         indices = list(range(len(dataset)))
     n_inputs = len(indices)
-    logger.info(f'{n_inputs} inputs from {input_root} (mode={args.mode})')
 
-    # The real->synth operator is needed by DPS (it is what DPS inverts) and by
-    # validate mode (it derives y from the reference). Built once and shared:
-    # constructing it twice would hold a trained generator in GPU memory twice.
-    # The uvcgan baseline in generate mode needs none of it.
-    operator = None
-    if args.method == 'dps' or args.mode == 'validate':
-        operator = get_operator(device=device, **measure_config['operator'])
-        if operator.direction != 'ba':
-            raise ValueError(
-                f"DPS needs the real->synth operator, but the task config gives "
-                f"direction: {operator.direction!r}. DPS inverts its operator, "
-                "so generating R from S requires direction: ba.")
+    logger.info(f'Device: {device}')
+    logger.info(f'Model under test: {label} '
+                f'(method={args.method}'
+                + (f', operator={args.dps_framework}' if args.method == 'dps' else '')
+                + ')')
+    logger.info(f'{n_inputs} inputs from {input_root} '
+                f'(input_mode={args.input_mode}'
+                + (f', y = G_RS[{args.rs_framework}](real)'
+                   if args.input_mode == 'roundtrip' else '')
+                + ')')
 
-    # In validate mode the measurement is derived from the reference by the same
-    # operator DPS inverts, so y is guaranteed to lie in A's output distribution.
-    # In generate mode the input already IS the measurement.
+    # The R->S model that BUILDS the measurement. Deliberately separate from the
+    # operator DPS inverts: holding it fixed across models is what makes the
+    # comparison like-for-like.
     to_measurement = None
-    if args.mode == 'validate':
-        to_measurement = lambda ref: operator.forward(ref).detach()
+    if args.input_mode == 'roundtrip':
+        rs_op = build_operator(measure_config, args.rs_framework, 'ba',
+                               device, args.uvcgan_path)
+        to_measurement = lambda ref: rs_op.forward(ref).detach()
+
+    # Recorded in the manifest so a sweep's comparison table carries the swept
+    # parameter as a real column, instead of leaving it encoded in directory
+    # names for a reader to decode.
+    used_scale = ''
 
     if args.method == 'uvcgan':
-        # Baseline: the S -> R generator applied directly. Note this is the
-        # OPPOSITE direction to the DPS operator, so flip it explicitly.
-        op_cfg = dict(measure_config['operator'])
-        op_cfg['direction'] = 'ab'
-        generator = get_operator(device=device, **op_cfg)
-        generate = lambda s: generator.forward(s).detach()
+        sr_op = build_operator(measure_config, 'uvcgan2', 'ab', device,
+                               args.uvcgan_path)
+        generate = lambda s: sr_op.forward(s).detach()
     else:
+        # The operator DPS inverts. Reused as the measurement builder only when
+        # rs_framework happens to match, which build_operator does not assume.
+        operator = build_operator(measure_config, args.dps_framework, 'ba',
+                                  device, args.uvcgan_path)
         model = create_model(**model_config).to(device).eval()
         noiser = get_noise(**measure_config['noise'])
 
@@ -174,7 +259,8 @@ def main():
         params = dict(cond_config['params'])
         if args.scale is not None:
             params['scale'] = args.scale
-        logger.info(f"Conditioning: {cond_config['method']} scale={params['scale']}")
+        used_scale = params['scale']
+        logger.info(f"Conditioning: {cond_config['method']} scale={used_scale}")
 
         cond_method = get_conditioning_method(
             cond_config['method'], operator, noiser, **params)
@@ -190,22 +276,39 @@ def main():
     manifest_path = os.path.join(args.out_dir, 'manifest.csv')
     with open(manifest_path, 'w', newline='') as fh:
         writer = csv.writer(fh)
-        # source_image is what carries the known lattice parameters.
-        writer.writerow(['output_image', 'source_image', 'method',
-                         'sample_index', 'seed'])
+        writer.writerow([
+            'output_image',
+            'source_image',       # whose lattice defines the label
+            'ground_truth',       # what the output should reconstruct (roundtrip)
+            'measurement_image',  # the y actually fed to the model
+            'label', 'method', 'dps_framework', 'rs_framework', 'scale',
+            'sample_index', 'seed',
+        ])
 
         for n, i in enumerate(indices):
             source_path = dataset.fpaths[i]
             s = dataset[i].unsqueeze(0).to(device)
+
+            ground_truth, meas_rel = '', ''
             if to_measurement is not None:
+                # In roundtrip the real image is both the label source (G_RS
+                # preserves the lattice) and the reconstruction target.
+                ground_truth = source_path
                 s = to_measurement(s)
+                meas_rel = f'{n:05d}.png'
+                plt.imsave(os.path.join(meas_dir, meas_rel), to_display(s))
+
             logger.info(f'[{n + 1}/{n_inputs}] {os.path.basename(source_path)}')
 
             for k in range(args.samples_per_input):
                 out = generate(s)
                 fname = f'{n:05d}_{k:02d}.png'
-                plt.imsave(os.path.join(img_dir, fname), clear_color(out))
-                writer.writerow([fname, source_path, args.method, k, args.seed])
+                plt.imsave(os.path.join(img_dir, fname), to_display(out))
+                writer.writerow([
+                    fname, source_path, ground_truth, meas_rel,
+                    label, args.method, args.dps_framework or '',
+                    args.rs_framework or '', used_scale, k, args.seed,
+                ])
             fh.flush()
 
     logger.info(f'Wrote {args.out_dir} (manifest: {manifest_path})')

@@ -38,6 +38,14 @@ import _bootstrap  # noqa: F401  -- puts the repo root on sys.path
 import numpy as np
 from PIL import Image
 
+from util.image_metrics import (
+    InceptionFeatures,
+    fid_is_reliable,
+    frechet_distance,
+    kernel_distance,
+    psnr,
+    ssim,
+)
 from util.lattice_metrics import (
     angle_difference,
     lattice_params,
@@ -70,20 +78,51 @@ def read_gray(path, image_size=DEFAULT_IMAGE_SIZE):
     return np.asarray(img, dtype=np.float64) / 255.0
 
 
-def load_dir(root, limit=None):
+def load_dir(root, limit=None, exclude=None):
     """Sorted PNGs, subsampled by even stride rather than truncation.
 
     Crops are named "<photo>_sample_<k>", so paths[:limit] collapses onto the
     alphabetically-first photos: a 500-image reference drawn that way covers 100
     distinct scenes instead of 500.
+
+    `exclude` drops paths before striding, so the returned set is still `limit`
+    images. Used to keep the realism reference disjoint from the images being
+    scored -- see collect_evaluated_sources.
     """
     paths = sorted(glob(os.path.join(root, '**', '*.png'), recursive=True))
+    if exclude:
+        excl = {os.path.abspath(p) for p in exclude}
+        paths = [p for p in paths if os.path.abspath(p) not in excl]
     if not paths:
         raise ValueError(f'No PNGs under {root}')
     if limit and limit < len(paths):
         stride = len(paths) / limit
         return [paths[int(i * stride)] for i in range(limit)]
     return paths
+
+
+def collect_evaluated_sources(result_dirs):
+    """Every input and ground-truth image referenced by the runs being scored.
+
+    These are excluded from the realism reference. In the round trip the sources
+    are drawn from the same real/val split the reference comes from, so without
+    this the generated images would be compared against a distribution
+    containing the very images they were reconstructed from -- optimistic for
+    FID/KID and for the spectral distance. In synth mode the sources are
+    synthetic and never appear in a real reference, so nothing is excluded.
+    """
+    found = set()
+    for rd in result_dirs:
+        manifest = os.path.join(rd, 'manifest.csv')
+        if not os.path.exists(manifest):
+            continue
+        with open(manifest) as fh:
+            for row in csv.DictReader(fh):
+                for key in ('source_image', 'ground_truth'):
+                    p = (row.get(key) or '').strip()
+                    if p:
+                        found.add(os.path.abspath(p))
+    return found
 
 
 def summarise_reference(paths, image_size=DEFAULT_IMAGE_SIZE):
@@ -132,7 +171,8 @@ def nearest_neighbour_distances(query_feats, ref_feats):
     return np.sqrt(np.maximum(2.0 - 2.0 * sims.max(axis=1), 0.0))
 
 
-def evaluate_result_dir(result_dir, image_size=DEFAULT_IMAGE_SIZE, n_peaks=3):
+def evaluate_result_dir(result_dir, image_size=DEFAULT_IMAGE_SIZE, n_peaks=3,
+                        lpips_model=None):
     '''Per-image records from one generate_augmented.py output directory.'''
     manifest = os.path.join(result_dir, 'manifest.csv')
     if not os.path.exists(manifest):
@@ -163,8 +203,36 @@ def evaluate_result_dir(result_dir, image_size=DEFAULT_IMAGE_SIZE, n_peaks=3):
         gen = lattice_params(img)
         gen_sig = lattice_signature(img, k=n_peaks)
 
+        # Paired metrics need a per-output target, which exists only in the
+        # round trip (real -> G_RS -> SR model), where the original real image
+        # is what the output should have reconstructed. In the synth -> real
+        # direction there is no single correct answer, so these stay absent
+        # rather than being computed against something arbitrary.
+        paired = {}
+        gt_path = (row.get('ground_truth') or '').strip()
+        if gt_path:
+            if not os.path.exists(gt_path):
+                raise FileNotFoundError(
+                    f'ground_truth {gt_path} from the manifest is missing; '
+                    'paired metrics cannot be computed.')
+            gt = read_gray(gt_path, image_size)
+            paired['psnr'] = psnr(img, gt)
+            paired['ssim'] = ssim(img, gt)
+            if lpips_model is not None:
+                paired['lpips'] = lpips_model(img, gt)
+
         records.append({
+            # `label` names the model in the comparison tables; older manifests
+            # predate it, so fall back to the method.
+            'label': row.get('label') or row['method'],
             'method': row['method'],
+            # The swept hyperparameter, so a sweep table has it as a column
+            # rather than encoded in directory names.
+            'scale': row.get('scale', ''),
+            'dps_framework': row.get('dps_framework', ''),
+            'rs_framework': row.get('rs_framework', ''),
+            'ground_truth': gt_path,
+            **paired,
             'output_image': row['output_image'],
             'source_image': src_path,
             'sample_index': int(row['sample_index']),
@@ -211,7 +279,19 @@ def parse_args():
                    help='Held-out REAL images: the realism reference.')
     p.add_argument('--real_train_root', type=str, default=None,
                    help='Real TRAINING images, for the memorisation check.')
-    p.add_argument('--out_csv', type=str, default=None)
+    p.add_argument('--out_csv', type=str, default=None,
+                   help='Per-image metrics.')
+    p.add_argument('--out_summary_csv', type=str, default=None,
+                   help='The comparison table itself, one row per model. This '
+                        'is what goes into the report.')
+    p.add_argument('--lpips', action='store_true',
+                   help='Perceptual paired metric (round trip only). Downloads '
+                        'weights on first use.')
+    p.add_argument('--fid_kid', action='store_true',
+                   help='Distributional metrics against the real reference. '
+                        'Downloads InceptionV3 weights on first use. KID is the '
+                        'one to trust below a few thousand images; FID is '
+                        'reported for familiarity and flagged when unreliable.')
     p.add_argument('--limit_reference', type=int, default=500,
                    help='Realism reference set size. Bounded because each image '
                         'costs an FFT.')
@@ -232,9 +312,22 @@ def parse_args():
 def main():
     args = parse_args()
 
+    # Build the reference AFTER reading the manifests, so the images being
+    # scored can be held out of the distribution they are scored against.
+    evaluated = collect_evaluated_sources(args.result_dir)
+
     logger.info(f'Reference (real) set: {args.real_root} '
                 f'(all images measured at {args.image_size}px)')
-    real_paths = load_dir(args.real_root, args.limit_reference)
+    real_paths = load_dir(args.real_root, args.limit_reference,
+                          exclude=evaluated)
+    # Count what was actually removed rather than inferring it from directory
+    # names, which breaks for a trailing slash or images in a subdirectory
+    # (load_dir globs recursively).
+    n_excluded = sum(1 for p in load_dir(args.real_root)
+                     if os.path.abspath(p) in evaluated)
+    if n_excluded:
+        logger.info(f'  excluded {n_excluded} image(s) that these runs were '
+                    'derived from, keeping the reference disjoint')
     real = summarise_reference(real_paths, args.image_size)
     logger.info(f'  {real["n"]} images, '
                 f'prominence median {real["prominence_median"]:.1f} '
@@ -253,11 +346,26 @@ def main():
         logger.info(f'Real-to-real NN distance: median {np.median(real_nn):.4f} '
                     f'(memorisation floor)')
 
+    # Built once and shared: constructing these per image would dominate runtime.
+    lpips_model = None
+    if args.lpips:
+        from util.image_metrics import LPIPS
+        logger.info('Loading LPIPS (first use downloads weights)')
+        lpips_model = LPIPS()
+
+    inception, real_feats = None, None
+    if args.fid_kid:
+        logger.info('Loading InceptionV3 for FID/KID')
+        inception = InceptionFeatures()
+        real_feats = inception(read_gray(p, args.image_size) for p in real_paths)
+        logger.info(f'  reference features: {real_feats.shape}')
+
     all_records, summaries = [], []
     for result_dir in args.result_dir:
-        records = evaluate_result_dir(result_dir, args.image_size, args.n_peaks)
+        records = evaluate_result_dir(result_dir, args.image_size, args.n_peaks,
+                                      lpips_model=lpips_model)
         all_records.extend(records)
-        method = records[0]['method']
+        model = records[0]['label']
 
         n = min(len(r['_profile']) for r in records)
         mean_profile = np.mean([r['_profile'][:n] for r in records], axis=0)
@@ -280,7 +388,10 @@ def main():
                 [r['spacing_rel_error'] for r in strong], 90)) if strong else None,
             'spacing_err_weak': float(np.nanmedian(
                 [r['spacing_rel_error'] for r in weak])) if weak else None,
-            'method': method,
+            'model': model,
+            'scale': records[0].get('scale', ''),
+            'dps_framework': records[0].get('dps_framework', ''),
+            'rs_framework': records[0].get('rs_framework', ''),
             'n_images': len(records),
             'n_sources': len({r['source_image'] for r in records}),
             'spacing_err_median': float(np.nanmedian(
@@ -299,6 +410,23 @@ def main():
             'diversity_rmse': diversity(records, args.image_size),
         }
 
+        # Paired metrics exist only where the manifest carried a ground truth.
+        for key in ('psnr', 'ssim', 'lpips'):
+            vals = [r[key] for r in records if key in r and np.isfinite(r[key])]
+            summary[f'{key}_median'] = float(np.median(vals)) if vals else None
+
+        if inception is not None:
+            gen_feats = inception(read_gray(r['_path'], args.image_size)
+                                  for r in records)
+            kid_mean, kid_std = kernel_distance(
+                gen_feats, real_feats,
+                subset_size=min(100, len(gen_feats), len(real_feats)))
+            summary['kid'] = kid_mean
+            summary['kid_std'] = kid_std
+            summary['fid'] = frechet_distance(gen_feats, real_feats)
+            summary['fid_reliable'] = fid_is_reliable(len(gen_feats),
+                                                      len(real_feats))
+
         if ref_feats is not None:
             nn = nearest_neighbour_distances(
                 feature_matrix([r['_path'] for r in records],
@@ -308,11 +436,11 @@ def main():
 
         summaries.append(summary)
 
-    # Several result dirs can share a method -- a `scale` sweep is all 'dps' --
-    # so fall back to the directory name to keep the columns distinguishable.
-    counts = Counter(s['method'] for s in summaries)
+    # Prefer the label the generating run recorded. Fall back to the directory
+    # name when several dirs share one -- a `scale` sweep is all one model.
+    counts = Counter(s['model'] for s in summaries)
     for s in summaries:
-        label = (s['method'] if counts[s['method']] == 1
+        label = (s['model'] if counts[s['model']] == 1
                  else os.path.basename(os.path.normpath(s['result_dir'])))
         s['label'] = label[:14]
 
@@ -344,6 +472,19 @@ def main():
     row('peak prominence (median)', 'prominence_median', '{:.1f}',
         f'real={real["prominence_median"]:.1f} <- target')
     row('  (source images)', 'src_prominence_median', '{:.1f}', 'for reference')
+    if any(s.get('psnr_median') is not None for s in summaries):
+        print('-- reconstruction (round trip only) '.ljust(width, '-'))
+        row('PSNR dB (median)', 'psnr_median', '{:.2f}', 'higher better')
+        row('SSIM (median)', 'ssim_median', '{:.4f}', 'higher better')
+        row('LPIPS (median)', 'lpips_median', '{:.4f}', 'lower better')
+    if any('kid' in s for s in summaries):
+        print('-- distribution vs real '.ljust(width, '-'))
+        row('KID', 'kid', '{:.5f}', 'lower better; trust this one')
+        row('  subset spread', 'kid_std', '{:.5f}',
+            'noise scale, NOT a standard error (subsets overlap)')
+        reliable = all(s.get('fid_reliable') for s in summaries)
+        row('FID', 'fid', '{:.2f}',
+            'lower better' if reliable else 'UNRELIABLE at this n -- see KID')
     print('-- diversity '.ljust(width, '-'))
     row('pairwise RMSE across variants', 'diversity_rmse', note='higher = more varied')
     if ref_feats is not None:
@@ -358,12 +499,25 @@ def main():
 
     if args.out_csv:
         os.makedirs(os.path.dirname(os.path.abspath(args.out_csv)), exist_ok=True)
-        fields = [k for k in all_records[0] if not k.startswith('_')]
+        # Union of keys: paired metrics are present only for round-trip runs, so
+        # the first record's keys are not necessarily the full set.
+        fields = list(dict.fromkeys(
+            k for r in all_records for k in r if not k.startswith('_')))
         with open(args.out_csv, 'w', newline='') as fh:
             writer = csv.DictWriter(fh, fieldnames=fields, extrasaction='ignore')
             writer.writeheader()
             writer.writerows(all_records)
         logger.info(f'Per-image metrics: {args.out_csv}')
+
+    if args.out_summary_csv:
+        os.makedirs(os.path.dirname(os.path.abspath(args.out_summary_csv)),
+                    exist_ok=True)
+        fields = list(dict.fromkeys(k for s in summaries for k in s))
+        with open(args.out_summary_csv, 'w', newline='') as fh:
+            writer = csv.DictWriter(fh, fieldnames=fields, extrasaction='ignore')
+            writer.writeheader()
+            writer.writerows(summaries)
+        logger.info(f'Comparison table: {args.out_summary_csv}')
 
 
 if __name__ == '__main__':

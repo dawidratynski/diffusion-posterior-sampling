@@ -157,3 +157,46 @@ def test_signature_distance_catches_secondary_vector_distortion():
     d_ref = lattice_params(two_d_lattice(10.0, 16.0, 0.0, 90.0))
     d_skew = lattice_params(two_d_lattice(10.0, 20.0, 0.0, 90.0))
     assert spacing_error(d_skew["spacing_px"], d_ref["spacing_px"]) < 0.01
+
+
+def square_wave(period, angle_deg=0.0, size=N):
+    """Strong odd harmonics at the SAME angle as the fundamental."""
+    return np.sign(grating(period, angle_deg, size)) * 0.8
+
+
+def test_signature_matching_is_not_confused_by_harmonics():
+    """A lattice direction contributes a fundamental AND its harmonics at one
+    angle, so matching by angle alone is ambiguous and falls out of list order.
+    Matching in reciprocal space separates them by radius."""
+    from util.lattice_metrics import lattice_signature, signature_distance
+
+    img = square_wave(24.0, 20.0) + grating(30.0, 110.0) * 0.6
+    sig = lattice_signature(img, k=4)
+
+    angles = [round(p["angle_deg"]) for p in sig]
+    assert len(set(angles)) < len(angles), "expected repeated angles (harmonics)"
+
+    # Identical lattices must score ~0 regardless of that ambiguity.
+    assert signature_distance(sig, lattice_signature(img, k=4)) < 1e-6
+
+
+def test_signature_still_detects_drift_despite_harmonics():
+    """Reciprocal-space matching must not pair a drifted fundamental with a
+    harmonic and thereby hide the drift."""
+    from util.lattice_metrics import lattice_signature, signature_distance
+
+    ref = lattice_signature(square_wave(24.0, 20.0), k=3)
+    same = lattice_signature(square_wave(24.0, 20.0), k=3)
+    drifted = lattice_signature(square_wave(36.0, 20.0), k=3)   # +50%
+
+    assert signature_distance(ref, same) < 0.02
+    assert signature_distance(ref, drifted) > 0.2, "drift was masked"
+
+
+def test_reciprocal_vector_matches_peak_geometry():
+    from util.lattice_metrics import _reciprocal_vector
+
+    v = _reciprocal_vector({"angle_deg": 0.0, "radius_px": 5.0})
+    assert np.allclose(v, [5.0, 0.0])
+    v = _reciprocal_vector({"angle_deg": 90.0, "radius_px": 4.0})
+    assert np.allclose(v, [0.0, 4.0], atol=1e-9)
