@@ -32,6 +32,23 @@ def test_to_display_is_the_exact_inverse_of_the_dataset_mapping():
     assert np.allclose(recovered, png_values, atol=1e-6)
 
 
+def test_save_png_round_trip_is_exact_on_every_level(tmp_path):
+    """Every 8-bit level must survive dataset-mapping -> save_png -> read.
+
+    plt.imsave truncates instead of rounding and lost a level on 63 of 256.
+    """
+    from PIL import Image
+
+    from util.img_utils import save_png
+    v = torch.arange(256, dtype=torch.float32)
+    x = ((v / 255.0) * 2 - 1).view(1, 1, 1, 256).expand(1, 3, 1, 256)
+    path = tmp_path / "levels.png"
+    save_png(path, x)
+    img = Image.open(path)
+    assert img.mode == "RGB"
+    assert np.array_equal(np.asarray(img)[0, :, 0], v.numpy().astype(np.uint8))
+
+
 def test_to_display_does_not_mutate_its_input():
     x = torch.linspace(-1, 1, 48).reshape(1, 3, 4, 4).clone()
     before = x.clone()

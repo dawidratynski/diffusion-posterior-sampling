@@ -96,6 +96,23 @@ def to_display(x):
     return np.clip((arr + 1.0) / 2.0, 0.0, 1.0)
 
 
+def save_png(path, x):
+    """Write a [-1, 1] image tensor as an 8-bit RGB PNG, ROUNDING to the grid.
+
+    Use this, not `plt.imsave(path, to_display(x))`. matplotlib converts floats
+    to bytes by TRUNCATION (`(x * 255).astype(uint8)`), and in float32
+    `((v/255)*2 - 1 + 1) / 2 * 255` lands just below v for about a quarter of
+    the levels: a dataset image written that way came back one level darker on
+    63 of 256 grey levels, and continuous model outputs were biased by -0.5
+    levels on average -- applied to every generated image but never to the
+    source PNGs they are compared against. It also wrote RGBA, not RGB.
+    Rounding makes the round trip exact.
+    """
+    from PIL import Image
+    arr = np.round(to_display(x) * 255.0).astype(np.uint8)
+    Image.fromarray(arr, mode='RGB').save(path)
+
+
 def prepare_im(load_dir, image_size, device):
     ref_img = torch.from_numpy(normalize_np(plt.imread(load_dir)[:, :, :3].astype(np.float32))).to(device)
     ref_img = ref_img.permute(2, 0, 1)

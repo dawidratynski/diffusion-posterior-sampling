@@ -200,3 +200,24 @@ def test_reciprocal_vector_matches_peak_geometry():
     assert np.allclose(v, [5.0, 0.0])
     v = _reciprocal_vector({"angle_deg": 90.0, "radius_px": 4.0})
     assert np.allclose(v, [0.0, 4.0], atol=1e-9)
+
+
+def test_signature_matching_handles_the_0_180_seam():
+    """A 4-degree rotation must score the same across 0/180 as elsewhere."""
+    from util.lattice_metrics import lattice_signature, signature_distance
+
+    def lattice(angles, period=20, n=160):
+        yy, xx = np.mgrid[0:n, 0:n]
+        img = sum(np.cos(2 * np.pi * (xx * np.cos(np.radians(a))
+                                      + yy * np.sin(np.radians(a))) / period)
+                  for a in angles)
+        img = (img - img.min()) / (img.max() - img.min())
+        return np.stack([img] * 3, -1)
+
+    def err(base):
+        a = lattice([base, base + 60, base + 120])
+        b = lattice([base - 4, base + 56, base + 116])
+        return signature_distance(lattice_signature(a), lattice_signature(b))
+
+    assert err(2) < 0.05            # used to be ~0.73
+    assert err(2) < 3 * err(45) + 0.01

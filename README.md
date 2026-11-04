@@ -279,8 +279,8 @@ source — that mapping is what carries the labels.
 # product: y IS the synthetic image
 uv run python scripts/generate_augmented.py ... \
     --input_mode synth --synth_root ../dataset/synth/val \
-    --method dps --dps_framework uvcgan2 --uvcgan_path /path/to/model \
-    --out_dir ./results/dps --label dps_uvcgan --samples_per_input 4
+    --method dps --dps_framework uvcgan2 --uvcgan_path /path/to/uvcgan_gan \
+    --out_dir ./results/dps --label dps_uvcgan_gan --samples_per_input 4
 
 # round trip: y = G_RS(real image), and the real image is the ground truth,
 # so PSNR/SSIM/LPIPS apply
@@ -293,8 +293,15 @@ uv run python scripts/generate_augmented.py ... \
 
 The operator is named on the command line, never inherited from the task config.
 `--rs_framework` (which R→S model builds the measurement) is **separate** from
-`--dps_framework` (which operator DPS inverts): the three-model comparison needs
+`--dps_framework` (which operator DPS inverts): the five-model comparison needs
 every model to see the *same* measurement while inverting its own operator.
+Likewise `--rs_path` (weights of the measurement builder) is separate from
+`--uvcgan_path` (weights of the model under test), since e.g. the GAN UVCGAN may
+build `y` for DPS over the WGAN one.
+
+The five models are `uvcgan_gan`, `uvcgan_wgan` (direct translation by the
+GAN- and WGAN-trained UVCGANs), `dps_uvcgan_gan`, `dps_uvcgan_wgan` (DPS
+inverting each one's R→S generator) and `dps_analytic`.
 
 `--method uvcgan` runs the direct-translation baseline through the same
 interface. It is deterministic, so `--samples_per_input > 1` is rejected rather
@@ -302,7 +309,19 @@ than silently emitting duplicates. Both modes write the same manifest format,
 so `evaluate.py` consumes either.
 
 For the full comparison, drive it with `scripts/run_comparison.py`, which
-enumerates the models, skips those whose weights are missing, and is resumable.
+enumerates the models, skips those whose weights are missing
+(`--uvcgan_gan_path`, `--uvcgan_wgan_path`, each gating its own pair), and is
+resumable. `--rs_models` lists the round-trip measurement builders (default
+`auto`: every UVCGAN whose weights exist); one round trip runs per builder, into
+`roundtrip_<builder>/`.
+
+`--stage sweep` tunes the conditioning scale for each DPS model separately but
+by one fixed rule: a coarse log grid plus a refinement round on `synth/train`
+inputs (disjoint from the final runs' `synth/val`). The rule keeps scales that
+preserve the lattice and don't memorise, picks the lowest KID among them, and
+breaks ties within KID noise by label validity. The result goes to
+`chosen_scales.json`, which the notebook feeds into `--stage final`. See
+`docs/methods.md` §4.1.
 
 ## Evaluation
 

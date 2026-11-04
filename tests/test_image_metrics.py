@@ -110,6 +110,48 @@ def test_kid_is_deterministic_for_a_fixed_seed():
     assert m1 == m2
 
 
+def test_kid_unequal_sizes_matches_brute_force():
+    """The estimator must handle m != n exactly (models differ in n)."""
+    from util.image_metrics import _mmd2_unbiased
+    rng = np.random.default_rng(0)
+    d = 8
+    x, y = rng.normal(size=(7, d)), rng.normal(0.3, 1, size=(11, d))
+
+    def k(a, b):
+        return (a @ b / d + 1) ** 3
+
+    m, n = len(x), len(y)
+    brute = (sum(k(x[i], x[j]) for i in range(m) for j in range(m) if i != j)
+             / (m * (m - 1))
+             + sum(k(y[i], y[j]) for i in range(n) for j in range(n) if i != j)
+             / (n * (n - 1))
+             - 2 * sum(k(x[i], y[j]) for i in range(m) for j in range(n))
+             / (m * n))
+    assert np.isclose(_mmd2_unbiased(x, y), brute)
+
+
+def test_kid_uses_the_whole_reference_not_a_prefix():
+    """A 50-image model used to be scored against the first 50 references only."""
+    gen, ref = _feats(50, seed=0), _feats(500, seed=1)
+    shifted = ref.copy()
+    shifted[:100] += 1.0          # unrepresentative prefix (sorted file order)
+    clean, _ = kernel_distance(gen, ref, n_subsets=5)
+    skewed, _ = kernel_distance(gen, shifted, n_subsets=5)
+    prefix_only, _ = kernel_distance(gen, shifted[:50], n_subsets=5)
+    assert skewed < prefix_only / 5   # whole reference dilutes the prefix
+    assert abs(skewed - clean) < abs(prefix_only - clean)
+
+
+def test_kid_does_not_reward_or_penalise_repeated_variants():
+    """4 variants per source must not count as 4 independent samples."""
+    gen, ref = _feats(50, seed=0), _feats(300, seed=1)
+    once, _ = kernel_distance(gen, ref, n_subsets=5)
+    groups = np.repeat(np.arange(50), 4)
+    four, _ = kernel_distance(np.repeat(gen, 4, axis=0), ref, n_subsets=5,
+                              groups_a=groups)
+    assert np.isclose(once, four)
+
+
 def test_fid_reliability_flag_tracks_feature_dimension():
     """At our sample sizes FID cannot estimate a 2048-d covariance at all."""
     assert not fid_is_reliable(200, 500)

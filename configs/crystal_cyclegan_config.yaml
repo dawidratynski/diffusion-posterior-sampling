@@ -15,10 +15,13 @@
 conditioning:
   method: ps
   params:
-    # Tuned on the FINAL prior (synth-pretrained + real-finetuned) with the
-    # gamma=0.4 stand-in operator at a 250-step schedule, over 24 distinct
-    # photos x 2 variants. Re-tune when the real UVCGAN operator lands: the
-    # optimum depends on both the operator and the prior.
+    # FALLBACK ONLY. The comparison passes --scale per model, chosen by the
+    # fixed rule in run_comparison.py (`--stage sweep`, docs/methods.md §4.1),
+    # so this value is used only by direct invocations without --scale.
+    #
+    # Historical record: the hand-tuned value below predates that rule. Tuned
+    # on the final prior with the gamma=0.4 analytic operator at 250 steps, on
+    # the ROUND TRIP over 24 distinct photos x 2 variants:
     #
     #   scale          1.0     1.5     2.0
     #   spacing err    .000    .000    .000    (all at the measurement floor)

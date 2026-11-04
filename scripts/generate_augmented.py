@@ -1,17 +1,19 @@
-'''Generate realistic (R-like) images, for the three-way S->R model comparison.
+'''Generate realistic (R-like) images, for the five-way S->R model comparison.
 
-THE THREE MODELS UNDER TEST
----------------------------
-All three map a synth-domain image to a realistic one; they differ in how.
+THE MODELS UNDER TEST
+---------------------
+All map a synth-domain image to a realistic one; they differ in how. There are
+two trained UVCGANs (standard-GAN and Wasserstein-GAN loss), each used both
+directly and as a DPS operator. Which one a run uses is just --uvcgan_path.
 
   uvcgan          x = G_{S->R}(s)
                   Direct translation. Deterministic, so --samples_per_input > 1
                   is pointless and rejected.
-                  --method uvcgan
+                  --method uvcgan --uvcgan_path <gan or wgan model dir>
 
   dps + uvcgan    x ~ p_R(x) . p(s | G_{R->S}(x))
-                  DPS with the TRAINED real->synth generator as its operator.
-                  --method dps --dps_framework uvcgan2
+                  DPS with a TRAINED real->synth generator as its operator.
+                  --method dps --dps_framework uvcgan2 --uvcgan_path <dir>
 
   dps + analytic  as above with the analytic SpectralIdealizer as the operator.
                   The "no trained translation model" ablation.
@@ -35,7 +37,10 @@ TWO INPUT MODES
       separation is the point: every SR model must see the same y for the
       comparison to be apples-to-apples, including dps+analytic, whose operator
       then does not match the y it is given. That mismatch is not a flaw in the
-      experiment -- it is what the ablation measures.
+      experiment -- it is what the ablation measures. The builder's weights
+      are --rs_path, separate from --uvcgan_path, because the builder (say the
+      GAN UVCGAN) and the model under test (say DPS over the WGAN one) need not
+      share a checkpoint.
 
 Writes generated/, measurement/ (roundtrip only) and manifest.csv. The manifest
 records, per output: the input whose lattice defines the label, the ground truth
@@ -46,9 +51,9 @@ if any, and the measurement actually fed to the model.
         --diffusion_config configs/crystal_diffusion_config.yaml \
         --task_config configs/crystal_cyclegan_config.yaml \
         --input_mode roundtrip --real_root /path/to/dataset/real/val \
-        --rs_framework uvcgan2 --uvcgan_path /path/to/uvcgan_model \
-        --method dps --dps_framework uvcgan2 \
-        --out_dir ./results/rt_dps_uvcgan --label dps_uvcgan \
+        --rs_framework uvcgan2 --rs_path /path/to/uvcgan_gan \
+        --method dps --dps_framework uvcgan2 --uvcgan_path /path/to/uvcgan_wgan \
+        --out_dir ./results/rt_dps_uvcgan_wgan --label dps_uvcgan_wgan \
         --samples_per_input 4 --limit 50
 '''
 import argparse
@@ -56,7 +61,6 @@ import csv
 import os
 
 import _bootstrap  # noqa: F401  -- puts the repo root on sys.path
-import matplotlib.pyplot as plt
 import torch
 import yaml
 
@@ -65,7 +69,7 @@ from guided_diffusion.condition_methods import get_conditioning_method
 from guided_diffusion.gaussian_diffusion import create_sampler
 from guided_diffusion.measurements import get_noise, get_operator
 from guided_diffusion.unet import create_model
-from util.img_utils import to_display
+from util.img_utils import save_png
 from util.logger import get_logger
 
 FRAMEWORKS = ('uvcgan2', 'spectral', 'cyclegan_resnet', 'torchscript')
@@ -97,9 +101,13 @@ def parse_args():
                    help='dps: which real->synth operator DPS inverts. This is '
                         'what distinguishes the two DPS variants.')
     p.add_argument('--uvcgan_path', type=str, default=None,
-                   help='Model directory for any uvcgan2 framework selected '
-                        'above. Applies to both --rs_framework and '
-                        '--dps_framework and to --method uvcgan.')
+                   help='Model directory of the model UNDER TEST: used by '
+                        '--method uvcgan and by --dps_framework uvcgan2.')
+    p.add_argument('--rs_path', type=str, default=None,
+                   help='roundtrip: model directory for a weight-based '
+                        '--rs_framework. Defaults to --uvcgan_path, so a run '
+                        'where builder and model share weights needs only '
+                        'one path.')
 
     p.add_argument('--out_dir', type=str, required=True)
     p.add_argument('--label', type=str, default=None,
@@ -112,6 +120,11 @@ def parse_args():
     p.add_argument('--scale', type=float, default=None,
                    help='Override the conditioning scale from the task config.')
     p.add_argument('--seed', type=int, default=0)
+    p.add_argument('--resume', action='store_true',
+                   help='Continue an interrupted run in --out_dir: keep '
+                        'manifest rows whose image exists, skip those samples. '
+                        'Per-sample seeding makes the result identical to an '
+                        'uninterrupted run. run_comparison.py decides when.')
     p.add_argument('--device', type=str, default=None)
     return p.parse_args()
 
@@ -170,10 +183,10 @@ def validate_args(args):
         raise ValueError(
             '--method dps needs --dps_framework: the operator DPS inverts is '
             'what distinguishes the DPS variants, so it is never defaulted.')
-    if args.input_mode == 'synth' and args.rs_framework:
+    if args.input_mode == 'synth' and (args.rs_framework or args.rs_path):
         raise ValueError(
-            '--rs_framework only applies to --input_mode roundtrip; in synth '
-            'mode the input already is the measurement.')
+            '--rs_framework/--rs_path only apply to --input_mode roundtrip; in '
+            'synth mode the input already is the measurement.')
 
     return roots[args.input_mode]
 
@@ -235,7 +248,7 @@ def main():
     to_measurement = None
     if args.input_mode == 'roundtrip':
         rs_op = build_operator(measure_config, args.rs_framework, 'ba',
-                               device, args.uvcgan_path)
+                               device, args.rs_path or args.uvcgan_path)
         to_measurement = lambda ref: rs_op.forward(ref).detach()
 
     # Recorded in the manifest so a sweep's comparison table carries the swept
@@ -252,7 +265,14 @@ def main():
         # rs_framework happens to match, which build_operator does not assume.
         operator = build_operator(measure_config, args.dps_framework, 'ba',
                                   device, args.uvcgan_path)
-        model = create_model(**model_config).to(device).eval()
+        # Sampling needs grad w.r.t. the INPUT only. With the training config's
+        # use_checkpoint=True every DPS step re-ran the UNet forward inside the
+        # backward and also computed grads for all 82M weights (measured ~3x
+        # slower per step on CPU). Gradients w.r.t. x are identical either way.
+        # Both changes go together: frozen params WITH checkpointing raise
+        # "One of the differentiated Tensors does not require grad".
+        model = create_model(**{**model_config, 'use_checkpoint': False})
+        model = model.to(device).eval().requires_grad_(False)
         noiser = get_noise(**measure_config['noise'])
 
         cond_config = task_config['conditioning']
@@ -274,18 +294,36 @@ def main():
                 record=False, save_root=args.out_dir).detach()
 
     manifest_path = os.path.join(args.out_dir, 'manifest.csv')
+    header = [
+        'output_image',
+        'source_image',       # whose lattice defines the label
+        'ground_truth',       # what the output should reconstruct (roundtrip)
+        'measurement_image',  # the y actually fed to the model
+        'label', 'method', 'dps_framework', 'rs_framework', 'scale',
+        'sample_index', 'seed',
+    ]
+    # Resume: keep only rows whose image really reached disk (a row can be
+    # flushed before a disconnect loses its PNG), rewrite the manifest with
+    # them, and skip those samples below.
+    kept = []
+    if args.resume and os.path.exists(manifest_path):
+        with open(manifest_path) as fh:
+            kept = [r for r in csv.DictReader(fh) if os.path.exists(
+                os.path.join(img_dir, r['output_image']))]
+        logger.info(f'Resuming: {len(kept)} sample(s) already done')
+    done = {r['output_image'] for r in kept}
+
     with open(manifest_path, 'w', newline='') as fh:
         writer = csv.writer(fh)
-        writer.writerow([
-            'output_image',
-            'source_image',       # whose lattice defines the label
-            'ground_truth',       # what the output should reconstruct (roundtrip)
-            'measurement_image',  # the y actually fed to the model
-            'label', 'method', 'dps_framework', 'rs_framework', 'scale',
-            'sample_index', 'seed',
-        ])
+        writer.writerow(header)
+        for r in kept:
+            writer.writerow([r.get(c, '') for c in header])
+        fh.flush()
 
         for n, i in enumerate(indices):
+            if all(f'{n:05d}_{k:02d}.png' in done
+                   for k in range(args.samples_per_input)):
+                continue
             source_path = dataset.fpaths[i]
             s = dataset[i].unsqueeze(0).to(device)
 
@@ -296,18 +334,36 @@ def main():
                 ground_truth = source_path
                 s = to_measurement(s)
                 meas_rel = f'{n:05d}.png'
-                plt.imsave(os.path.join(meas_dir, meas_rel), to_display(s))
+                save_png(os.path.join(meas_dir, meas_rel), s)
 
             logger.info(f'[{n + 1}/{n_inputs}] {os.path.basename(source_path)}')
 
             for k in range(args.samples_per_input):
+                if f'{n:05d}_{k:02d}.png' in done:
+                    continue
+                # Reseed per (input, sample), keyed on the DATASET index i, not
+                # the position n. Seeding once at startup let model/operator
+                # construction consume the RNG (the spectral and uvcgan2
+                # operators left it in different states), so the DPS variants
+                # started from different noise for the same input, and every
+                # output depended on --limit. Now all models share x_T and the
+                # per-step noise for each (input, sample): a paired comparison.
+                sample_seed = args.seed * 1_000_003 + i * 1000 + k
+                torch.manual_seed(sample_seed)
                 out = generate(s)
+                if not torch.isfinite(out).all():
+                    # Would otherwise be written as a silent black PNG and
+                    # scored as a (terrible) sample.
+                    raise RuntimeError(
+                        f'non-finite output for {source_path} sample {k} '
+                        f'(seed {sample_seed}); the DPS gradient likely '
+                        'produced NaN/inf.')
                 fname = f'{n:05d}_{k:02d}.png'
-                plt.imsave(os.path.join(img_dir, fname), to_display(out))
+                save_png(os.path.join(img_dir, fname), out)
                 writer.writerow([
                     fname, source_path, ground_truth, meas_rel,
                     label, args.method, args.dps_framework or '',
-                    args.rs_framework or '', used_scale, k, args.seed,
+                    args.rs_framework or '', used_scale, k, sample_seed,
                 ])
             fh.flush()
 

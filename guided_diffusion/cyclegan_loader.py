@@ -68,40 +68,105 @@ def load_generator(framework: str, direction: str = 'ab', **kwargs) -> nn.Module
     return __LOADER__[framework](direction=direction, **kwargs)
 
 
-@register_loader('uvcgan2')
-def load_uvcgan2(direction: str, path: str, epoch: int = -1):
-    '''Load a UVCGAN2 (LS4GAN) generator.
+class UnitRangeAdapter(nn.Module):
+    '''Run a [0, 1] generator inside this pipeline's [-1, 1] convention.
 
-    UVCGAN2 saves a whole model directory (weights *plus* the config needed to
-    rebuild the architecture), so `path` is that directory, not a .pth file.
-
-    The exact accessor differs between uvcgan2 versions, so probe rather than
-    assume. If this fails, print the loaded object and adjust -- the generator
-    is a submodule of the returned model wrapper.
+    uvcgan2 feeds training images through a bare `ToTensor()` (so [0, 1], no
+    normalisation) and its generator presets end in a sigmoid (so [0, 1] out).
+    This pipeline -- the diffusion prior, the measurements, the saved PNGs --
+    is [-1, 1] throughout. Without this affine map the generator would receive
+    inputs half outside its training range and return outputs the rest of the
+    pipeline reads as dark, and nothing would fail: CycleGanOperator's range
+    check (|x| <= 1.5) passes [0, 1] values. The map is affine, so it keeps the
+    generator differentiable, which DPS requires.
     '''
+
+    def __init__(self, generator: nn.Module, source: str = ''):
+        super().__init__()
+        self.generator = generator
+        self.source = source  # human-readable provenance, printed by the probe
+
+    def forward(self, x):
+        # Every training image is grayscale stored as RGB (R=G=B, verified on
+        # the whole dataset), so the generator never saw unequal channels. The
+        # DPS posterior-mean estimates it receives can have them, so project
+        # onto the gray axis first. Exact no-op on dataset images; linear, so
+        # it keeps the operator differentiable.
+        x = x.mean(dim=1, keepdim=True).expand_as(x)
+        return self.generator((x + 1.0) / 2.0) * 2.0 - 1.0
+
+
+@register_loader('uvcgan2')
+def load_uvcgan2(direction: str, path: str, epoch: int | None = None,
+                 use_avg: bool = True):
+    '''Load one generator from a UVCGAN2 (LS4GAN) model directory.
+
+    `path` is the directory uvcgan2's train() wrote: config.json, the final
+    weights `net_gen_ab.pth` / `net_gen_ba.pth` (+ `net_avg_gen_*`), and
+    periodic snapshots under checkpoints/NNNN_net_*.pth. Verified against
+    uvcgan2 at github.com/LS4GAN/uvcgan2 (eval/funcs.py:start_model_eval).
+
+    epoch: None = the final weights if present, else the newest checkpoint;
+        an int = that checkpoint.
+    use_avg: use the EMA generator (`avg_gen_*`) when the model has one. This
+        is what uvcgan2's own inference uses (UVCGAN2.forward dispatches to
+        'avg-ab'/'avg-ba' whenever avg_momentum is set), so it is the model the
+        training run actually produced.
+
+    Returns the generator wrapped in UnitRangeAdapter -- see its docstring.
+    '''
+    import os
+
     try:
-        from uvcgan2.utils.funcs import load_model_from_path
-    except ImportError:
-        try:
-            from uvcgan2.utils.eval import load_model_from_path
-        except ImportError as e:
-            raise ImportError(
-                'uvcgan2 is not installed. Install it from '
-                'https://github.com/LS4GAN/uvcgan2 (see '
-                'uvcgan_training/clone_repo.py in the sibling repo).') from e
+        from uvcgan2.cgan import construct_model
+        from uvcgan2.config import Args
+    except ImportError as e:
+        raise ImportError(
+            'uvcgan2 is not installed. Install it from '
+            'https://github.com/LS4GAN/uvcgan2 (the notebook does this in '
+            'section 12).') from e
 
-    model = load_model_from_path(path, epoch=epoch, device='cpu')
+    if not os.path.exists(os.path.join(path, 'config.json')):
+        raise FileNotFoundError(
+            f'{path} has no config.json, so it is not a uvcgan2 model '
+            'directory. Point --uvcgan_path at the directory train() wrote '
+            '(it contains config.json and net_gen_ab.pth).')
 
-    attr = f'gen_{direction}'
-    holder = getattr(model, 'models', model)
-    gen = getattr(holder, attr, None)
-    if gen is None:
-        available = [a for a in dir(holder) if a.startswith('gen')]
+    args = Args.load(path)
+    model = construct_model(path, args.config, is_train=False, device='cpu')
+
+    if epoch is None:
+        if os.path.exists(os.path.join(path, f'net_gen_{direction}.pth')):
+            source = 'final weights'
+        else:
+            epoch = model.find_last_checkpoint_epoch()
+            if epoch <= 0:
+                raise FileNotFoundError(
+                    f'No final weights (net_gen_{direction}.pth) and no '
+                    f'checkpoints under {path}/checkpoints.')
+            source = f'checkpoint epoch {epoch} (no final weights)'
+    else:
+        # uvcgan2's ModelBase.load() returns WITHOUT loading anything for
+        # epoch <= 0, which would hand back the random initialisation.
+        if epoch <= 0:
+            raise ValueError(f'epoch must be a positive checkpoint number or '
+                             f'None (final weights), got {epoch}.')
+        source = f'checkpoint epoch {epoch}'
+    model.load(epoch)
+    loss = getattr(args.config, 'loss', None)
+    if loss:
+        source += f', trained with loss={loss}'
+
+    gens = model.models
+    name = f'gen_{direction}'
+    if use_avg and f'avg_gen_{direction}' in gens \
+            and gens[f'avg_gen_{direction}'] is not None:
+        name = f'avg_gen_{direction}'
+    if name not in gens or gens[name] is None:
         raise AttributeError(
-            f"Could not find '{attr}' on the loaded UVCGAN2 model. "
-            f"Generator-like attributes present: {available}. "
-            'Adjust load_uvcgan2() to match your uvcgan2 version.')
-    return gen
+            f"'{name}' not found on the loaded UVCGAN2 model; it has "
+            f'{sorted(k for k in gens if "gen" in k)}.')
+    return UnitRangeAdapter(gens[name], source=f'{name}, {source}')
 
 
 @register_loader('cyclegan_resnet')
@@ -219,7 +284,10 @@ class SpectralIdealizer(nn.Module):
 
         mag = spec.abs()
         peak = mag.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-8)
-        weight = (mag / peak) ** self.gamma
+        # clamp_min: d/dm m^gamma is infinite at m = 0 for gamma < 1, so an
+        # exactly-zero bin (flat or perfectly periodic x0_hat) made the DPS
+        # gradient NaN. 1e-6 of the peak is far below any bin that matters.
+        weight = (mag / peak).clamp_min(1e-6) ** self.gamma
         spec = spec * weight * self._bandpass(h, w, x.device, weight.dtype)
 
         out = torch.fft.ifft2(torch.fft.ifftshift(spec, dim=(-2, -1))).real

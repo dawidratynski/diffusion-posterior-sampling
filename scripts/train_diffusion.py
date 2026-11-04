@@ -78,8 +78,9 @@ def parse_args():
                         'resume is bit-exact.')
     p.add_argument('--keep_last', type=int, default=0,
                    help='Keep only the N most recent model_ema_*.pt (0 = all). '
-                        'Each is 4 bytes/param -- 330 MB at 82M params -- so a '
-                        '40k-step run saving every 2000 writes 6.6 GB. Use a '
+                        'Each is 4 bytes/param -- 330 MB at 82M params, or '
+                        '165 MB with --save_fp16 -- so a 40k-step run saving '
+                        'every 2000 writes 6.6 GB (3.3 GB fp16). Use a '
                         'small N for a pretrain whose intermediates you do not '
                         'need; keep all for a finetune you must sweep over. '
                         'NOTE on Google Drive: deletion moves files to the trash '

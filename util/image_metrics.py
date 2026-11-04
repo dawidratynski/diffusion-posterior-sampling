@@ -207,60 +207,88 @@ def frechet_distance(feats_a: np.ndarray, feats_b: np.ndarray) -> float:
                  - 2 * np.trace(covmean))
 
 
+def _poly_kernel(x, y, d):
+    return (x @ y.T / d + 1) ** 3
+
+
+def _mmd2_unbiased(x, y, groups_x=None):
+    '''Unbiased MMD^2 for sets of DIFFERENT sizes m and n.
+
+        E k(x,x') + E k(y,y') - 2 E k(x,y),
+
+    each self-term averaged over pairs of DISTINCT samples. With `groups_x`,
+    the x-x term only uses pairs from different groups: several samples drawn
+    from one source (the 4 DPS variants of one input) are correlated, so their
+    mutual kernel values would inflate E k(x,x') -- and only for stochastic
+    models, since a deterministic one has one sample per source.
+    '''
+    d = x.shape[1]
+    m, n = len(x), len(y)
+    kxx = _poly_kernel(x, x, d)
+    if groups_x is None:
+        mask = ~np.eye(m, dtype=bool)
+    else:
+        g = np.asarray(groups_x)
+        mask = g[:, None] != g[None, :]
+    if not mask.any():
+        raise ValueError('KID needs samples from at least 2 distinct sources')
+    kyy = _poly_kernel(y, y, d)
+    np.fill_diagonal(kyy, 0)
+    return (kxx[mask].mean() + kyy.sum() / (n * (n - 1))
+            - 2 * _poly_kernel(x, y, d).mean())
+
+
 def kernel_distance(feats_a: np.ndarray, feats_b: np.ndarray,
                     n_subsets: int = 100, subset_size: int | None = None,
-                    seed: int = 0) -> tuple:
+                    seed: int = 0, groups_a=None) -> tuple:
     '''KID: unbiased MMD^2 with the polynomial kernel, plus its spread.
 
         k(x, y) = (x.y / d + 1)^3
 
-    Unlike FID this estimator is unbiased at any sample size, which is what
-    makes it usable at the few-hundred-image scale here.
+    feats_a are the generated images, feats_b the reference. groups_a, if
+    given, names each generated image's source (e.g. its source image path),
+    so that variants of one source are not treated as independent samples.
 
     Returns (estimate, spread).
 
-    The ESTIMATE is computed once on the full sets. Binkowski et al. (2018)
-    average over random subsets, which is equally unbiased but noisier; with a
-    few hundred images there is no reason not to use all of them.
+    The ESTIMATE is computed once on the FULL sets, with the unbiased
+    estimator for unequal sizes. (An earlier version trimmed both sets to the
+    shorter length, so a 50-image model was scored against the first 50
+    reference images and a 200-image one against the first 200 -- different,
+    alphabetically-first slices of the reference, which made KID incomparable
+    across models.)
 
-    The SPREAD is the standard deviation across random subsets. Treat it as an
-    order-of-magnitude "differences smaller than this are noise", NOT as a
-    standard error: at these sample sizes the subsets overlap heavily (100 drawn
-    from 200), so they are far from independent and the spread understates the
-    true uncertainty. Computing it from disjoint subsets instead would allow
-    only two of them at n=200 -- too few to estimate a spread at all -- which is
-    why the overlapping version is kept and labelled rather than replaced.
+    The SPREAD is the standard deviation across n_subsets resamples: half of
+    the generated SOURCES (all their variants) against `subset_size`
+    reference images, the same subset_size for every model, so the spread
+    means the same thing for every model. Treat it as an order-of-magnitude
+    "differences smaller than this are noise", NOT a standard error: the
+    resamples overlap heavily, so it understates the true uncertainty.
 
     Lower is better; 0 means identical distributions.
     '''
     rng = np.random.default_rng(seed)
-    n = min(len(feats_a), len(feats_b))
-    subset_size = min(subset_size or 1000, n)
-    if subset_size < 2:
-        raise ValueError('KID needs at least 2 samples per set')
-    d = feats_a.shape[1]
+    if groups_a is None:
+        groups_a = np.arange(len(feats_a))
+    groups_a = np.asarray(groups_a)
+    if len(groups_a) != len(feats_a):
+        raise ValueError('groups_a must give one source per generated image')
+    if len(feats_b) < 2:
+        raise ValueError('KID needs at least 2 reference samples')
 
-    def mmd2(x, y):
-        kxx = (x @ x.T / d + 1) ** 3
-        kyy = (y @ y.T / d + 1) ** 3
-        kxy = (x @ y.T / d + 1) ** 3
-        m = len(x)
-        # Unbiased: drop the diagonal (self-similarity) terms.
-        np.fill_diagonal(kxx, 0)
-        np.fill_diagonal(kyy, 0)
-        return (kxx.sum() / (m * (m - 1)) + kyy.sum() / (m * (m - 1))
-                - 2 * kxy.mean())
+    estimate = _mmd2_unbiased(feats_a, feats_b, groups_a)
 
-    # mmd2 assumes equally sized sets (it divides both self-terms by m(m-1)),
-    # so trim to the common length for the full-set estimate.
-    estimate = mmd2(feats_a[:n], feats_b[:n])
-
-    vals = [
-        mmd2(feats_a[rng.choice(len(feats_a), subset_size, replace=False)],
-             feats_b[rng.choice(len(feats_b), subset_size, replace=False)])
-        for _ in range(n_subsets)
-    ]
-    return float(estimate), float(np.std(vals))
+    sources = np.unique(groups_a)
+    k_src = max(2, len(sources) // 2)
+    k_ref = min(subset_size or 100, len(feats_b) // 2)
+    vals = []
+    if len(sources) >= 3 and k_ref >= 2:
+        for _ in range(n_subsets):
+            pick = np.isin(groups_a, rng.choice(sources, k_src, replace=False))
+            ref = rng.choice(len(feats_b), k_ref, replace=False)
+            vals.append(_mmd2_unbiased(feats_a[pick], feats_b[ref],
+                                       groups_a[pick]))
+    return float(estimate), (float(np.std(vals)) if vals else 0.0)
 
 
 def fid_is_reliable(n_generated: int, n_reference: int,

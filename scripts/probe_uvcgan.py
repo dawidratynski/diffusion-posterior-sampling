@@ -53,17 +53,19 @@ def describe_directory(path):
 
 def check_import():
     print('\n--- uvcgan2 importable? ---')
-    for mod in ('uvcgan2.utils.funcs', 'uvcgan2.utils.eval'):
+    ok = True
+    for mod in ('uvcgan2.cgan', 'uvcgan2.config'):   # what load_uvcgan2 uses
         try:
             __import__(mod)
             print(f'  OK: {mod}')
-            return True
         except ImportError as e:
             print(f'  no: {mod} ({e})')
-    print('  uvcgan2 is not installed. Install it from')
-    print('  https://github.com/LS4GAN/uvcgan2 -- the loader needs its code to')
-    print('  rebuild the generator architecture from the saved config.')
-    return False
+            ok = False
+    if not ok:
+        print('  uvcgan2 is not installed (or is missing a dependency). Install')
+        print('  it from https://github.com/LS4GAN/uvcgan2 -- the loader needs its')
+        print('  code to rebuild the generator architecture from the saved config.')
+    return ok
 
 
 def check_load(path, direction, device):
@@ -84,8 +86,38 @@ def check_load(path, direction, device):
         print('  in the error.')
         return None
     n = sum(p.numel() for p in op.generator.parameters())
-    print(f'  OK: {type(op.generator).__name__}, {n / 1e6:.1f}M parameters')
+    # `source` names the weights AND the training loss -- check the loss matches
+    # the folder you uploaded it as (lsgan for the GAN, wgan for the WGAN).
+    print(f'  OK: {getattr(op.generator, "source", type(op.generator).__name__)}'
+          f', {n / 1e6:.1f}M parameters')
     return op
+
+
+def check_raw_range(op):
+    '''Is the generator really a [0, 1] -> [0, 1] model?
+
+    The loader wraps it in UnitRangeAdapter on that assumption (uvcgan2 trains
+    on ToTensor() images and its presets end in a sigmoid). If a config used a
+    different output activation, the adapter would silently mis-scale every
+    image -- so check the bare generator, not just the wrapped output.
+    '''
+    print('\n--- raw generator range (expects [0, 1] -> [0, 1]) ---')
+    raw = getattr(op.generator, 'generator', None)
+    if raw is None:
+        print('  skipped: not wrapped in UnitRangeAdapter')
+        return True
+    x = torch.rand(2, 3, SIZE, SIZE).to(op.device)
+    with torch.no_grad():
+        y = raw(x)
+    print(f'  raw output in [{y.min():.3f}, {y.max():.3f}]')
+    if y.min() < -1e-3 or y.max() > 1 + 1e-3:
+        print('  WARNING: raw output leaves [0, 1], so the generator is not')
+        print('  sigmoid-terminated and UnitRangeAdapter is the wrong conversion.')
+        print("  Check 'activ_output' in the model's config.json and adjust")
+        print('  load_uvcgan2() in guided_diffusion/cyclegan_loader.py.')
+        return False
+    print('  OK')
+    return True
 
 
 def check_forward(op, direction):
@@ -176,7 +208,7 @@ def check_domain_statistics(op_ba, real_root, synth_root, limit=24):
 
     reals, synths = load(real_root, limit), load(synth_root, limit)
     if reals is None or synths is None:
-        return
+        return True
 
     def stats(imgs):
         return (float(np.median([a.mean() for a in imgs])),
@@ -196,8 +228,10 @@ def check_domain_statistics(op_ba, real_root, synth_root, limit=24):
     print(f'  {"real synth images":<22}{s_mean:>9.3f}{s_prom:>13.0f}   <- target')
     close = abs(m_mean - s_mean) < 0.25
     print(f'  brightness {"matches" if close else "DOES NOT match"} the synth domain'
-          + ('' if close else '  <-- check the direction convention: is domain '
-                             "'a' synth in your uvcgan2 config?"))
+          + ('' if close else '  <-- check the direction convention (is domain '
+                             "'a' synth in your uvcgan2 config?) and that this "
+                             'is the trained model, not an early checkpoint'))
+    return close
 
 
 def main():
@@ -233,16 +267,21 @@ def main():
         if op is None:
             results[direction] = False
             continue
-        results[direction] = (check_forward(op, direction)
+        results[direction] = (check_raw_range(op)
+                              and check_forward(op, direction)
                               and check_determinism(op)
                               and check_gradient(op))
 
     if ops.get('ba') and args.real_root and args.synth_root:
-        check_domain_statistics(ops['ba'], args.real_root, args.synth_root)
+        # Counted in the verdict: a reversed direction loads, runs and
+        # differentiates perfectly, so this is the only check that sees it.
+        results['domain'] = check_domain_statistics(
+            ops['ba'], args.real_root, args.synth_root)
 
     print(f'\n{"=" * 72}')
     for d, passed in results.items():
-        print(f'  direction {d}: {"PASS" if passed else "FAIL"}')
+        what = 'G_RS lands in synth' if d == 'domain' else f'direction {d}'
+        print(f'  {what}: {"PASS" if passed else "FAIL"}')
     if all(results.values()):
         print('\nThe operator path works. The experiment notebook can run')
         print('unchanged with --uvcgan_path pointing here.')

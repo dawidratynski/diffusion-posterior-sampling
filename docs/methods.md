@@ -36,13 +36,28 @@ The thesis question is whether the $S\to R$ map is better done **directly** (a
 trained translation model) or as **posterior sampling** with a diffusion prior on
 $R$ conditioned through $G_{R\to S}$.
 
-### The three models compared
+### The five models compared
+
+Two UVCGAN models are trained, identical except for the adversarial loss:
+the least-squares GAN objective (LSGAN, `loss: lsgan` in
+`uvcgan_training/train_crystals.py`, uvcgan2's default; note this is not the
+original BCE "vanilla" GAN loss, so "GAN" below means LSGAN) and
+a Wasserstein GAN objective. Write $G^{\text{gan}}$ and $G^{\text{wgan}}$ for
+their generators. Each is used both directly and as a DPS operator:
 
 | label | definition | stochastic |
 |---|---|---|
-| `uvcgan` | $x = G_{S\to R}(s)$ | no |
-| `dps_uvcgan` | $x \sim p_R(x)\, p(s \mid G_{R\to S}(x))$, trained operator | yes |
+| `uvcgan_gan` | $x = G^{\text{gan}}_{S\to R}(s)$ | no |
+| `uvcgan_wgan` | $x = G^{\text{wgan}}_{S\to R}(s)$ | no |
+| `dps_uvcgan_gan` | $x \sim p_R(x)\, p(s \mid G^{\text{gan}}_{R\to S}(x))$ | yes |
+| `dps_uvcgan_wgan` | $x \sim p_R(x)\, p(s \mid G^{\text{wgan}}_{R\to S}(x))$ | yes |
 | `dps_analytic` | as above with the analytic operator $A$ of §2 | yes |
+
+All three DPS models share one diffusion prior $p_R$, so differences between
+them are attributable to the operator alone. Two questions follow from the
+grid: *direct vs DPS*, holding the trained model fixed (each row pair), and
+*whether the GAN/WGAN choice matters more for direct translation or as a DPS
+operator*.
 
 Note the direction inversion: DPS's operator is $R\to S$ even though the goal is
 $S\to R$, because **DPS inverts its operator**. The diffusion prior therefore
@@ -248,15 +263,91 @@ steps over-guides at 250 or 1000. Sweep and final runs therefore share one
 schedule (250 steps). This also explains why the DPS paper's $\zeta=0.3$ at 1000
 steps is consistent with larger values here.
 
-**$\zeta$ is operator-dependent.** The two DPS variants invert different
-operators and are tuned separately.
+**$\zeta$ is operator-dependent.** The three DPS variants invert different
+operators and are tuned separately, including the GAN and WGAN ones: the
+generators can differ in how strongly they idealise, which shifts the optimum.
 
-**It is tuned on the round trip and applied to both experiments.** The two
-experiments present different measurement distributions — $G_{R\to S}(\text{real})$
-versus a genuine synthetic image — so the optimum need not be identical. It is
-tuned once, on the round trip, because that is where paired metrics exist to
-judge it; sweeping both would double the sweep cost for a second-order effect.
-Worth stating as an assumption rather than leaving implicit.
+**It is tuned on synthetic inputs and applied to every experiment.** The
+experiments present different measurement distributions: a genuine synthetic
+image in the synth experiment, and $G_{R\to S}(\text{real})$ for each builder
+in the round trips. So the optimum need not be identical across them. It is
+tuned once per model, on the synth input distribution, because that is the
+deliverable. Applying the same value to the round trips is an assumption worth
+stating rather than leaving implicit. §4.1 gives the procedure.
+
+### 4.1 Choosing $\zeta$: one fixed rule for all three DPS models
+
+With three DPS models in the comparison, the danger is that tuning itself
+becomes the variable: a model searched more widely, or judged more leniently,
+gains an advantage that has nothing to do with its operator. So every model
+gets **the same procedure, the same budget and the same selection rule**, fixed
+before any result is seen and applied mechanically
+(`select_scale` in `scripts/run_comparison.py`). No value is chosen by eye.
+
+**Inputs.** 24 images from `synth/train`, strided so each comes from a distinct
+source (§6.3), 2 DPS samples each. The final experiments draw their synthetic
+inputs from `synth/val`, and the split is at source-photo level, so **tuning
+and test inputs are disjoint down to the photo**. The realism reference is
+split the same way: the sweep's KID is computed against reference half A,
+reported results against half B (§5.4). So the scale is tuned neither on the
+inputs nor on the reference it is then scored with. All metrics the rule uses are unpaired, so no
+ground truth, and hence no round trip or choice of builder, is needed. One
+caveat: `synth/train` was the diffusion prior's pretraining set. That affects
+only which inputs the scale is tuned on, not the test set, and the prior has
+since been finetuned to the real domain, so no effect on the choice is
+expected.
+
+**Grid.** Two rounds.
+
+1. A coarse, roughly log-spaced grid $\zeta \in \{0.1, 0.3, 1, 3, 10\}$. It is
+   wide on purpose: $\zeta$ multiplies $\nabla\|y - A(\hat{x}_0)\|$, whose
+   magnitude depends on the operator's Jacobian, and a trained generator's can
+   differ from the analytic operator's by an order of magnitude. A grid tuned to
+   one operator could miss another's optimum entirely.
+2. A refinement around the coarse winner $\zeta^*$: the geometric midpoints
+   $\sqrt{\zeta_{i-1}\zeta^*}$ and $\sqrt{\zeta^*\zeta_{i+1}}$ toward its
+   neighbours. If $\zeta^*$ lies at an edge of the grid, the outer point is
+   instead one step further out at the same ratio ($\zeta^{*2}/\zeta_{\text{inner}}$),
+   since the optimum may lie beyond it.
+
+The final choice is made over both rounds together, evaluated in one pass so
+all scales are judged against the same reference statistics.
+
+**Selection rule.**
+
+1. *Admissible* scales must satisfy both
+   $$\text{signature error (median)} \le 0.05 \qquad\text{and}\qquad
+     \text{NN distance (median)} \ge 0.98 \times \text{floor}.$$
+   Label validity (§5.1) is decisive for the deliverable, because drift means
+   mislabelled data. The 0.05 threshold sits well above the signature
+   error's measured noise floor on the inputs the sweep uses, synthetic images
+   (p90 0.013 under noise and under 30% occlusion). The second
+   condition excludes a prior that has started to reproduce training images
+   (§5.6). Being 2% under the real-to-real floor counts as "well below" it.
+2. Among admissible scales, the lowest **KID** (§5.4): the distributional
+   realism metric that is unbiased at this sample size.
+3. **KID ties go to label validity.** KID differences smaller than the best
+   scale's subset spread are noise (§5.4), so among the scales whose KID lies
+   within that spread of the minimum, the one with the lowest signature error
+   wins.
+
+If KID is unavailable, step 2 falls back to closeness of peak prominence to the
+real value, $|\log(\text{prominence}/\text{prominence}_{\text{real}})|$. If no
+scale is admissible, the lowest signature error is taken and the result is
+flagged for inspection rather than silently accepted.
+
+**Diversity is reported but is not a criterion.** It has a sensible range
+rather than a direction (§5.5), and a collapsed sampler already scores badly on
+realism. The procedure flags a diversity below the same-photo reference (0.108)
+as a collapse, and also flags a choice at the edge of the tried grid.
+
+**What the report should contain.** The full sweep table per model (appendix)
+and the chosen value with the rule's stated reason. Both are written by the
+sweep (`<model>_sweep.csv`, `chosen_scales.json`). Any manual override of the
+rule must be stated as such.
+
+**Budget.** 7 scales × 48 samples per model at 250 steps, about 2.7 GPU-hours
+per DPS model.
 
 ---
 
@@ -279,7 +370,11 @@ content* — larger than the threshold that is supposed to indicate real drift.
 
 Everything in the pipeline works in $[-1,1]$. `CrystalDataset` maps a PNG through
 $[0,255] \to [0,1] \to [-1,1]$, and generated images are written back with the
-**exact inverse**, $(x+1)/2$ clipped to $[0,1]$ (`util.img_utils.to_display`).
+**exact inverse**, $(x+1)/2$ clipped to $[0,1]$ and then **rounded** to the
+8-bit grid (`util.img_utils.save_png`). The rounding matters: an earlier version
+wrote via `matplotlib.imsave`, which truncates, and in float32 that lost one
+level on 63 of the 256 grey levels, a systematic −0.5-level bias on every
+generated image that the source PNGs did not share.
 A generated PNG and a dataset PNG therefore sit on the same scale and can be
 compared directly.
 
@@ -295,8 +390,36 @@ output to span the full range. That would:
 
 Any number quoted from a run whose images were saved that way — including the
 diversity reference points in §5.5 — is not comparable to one saved with the
-fixed map. Measured round trip through the current convention: PSNR 54.3 dB,
-SSIM 0.99998, the residual being 8-bit PNG quantisation alone.
+fixed map. With the rounding of `save_png` the round trip is **exact**: every
+one of the 256 grey levels survives dataset mapping and saving unchanged
+(tested).
+
+**The UVCGANs use a different convention, and are converted at the boundary.**
+uvcgan2 trains on images passed through a bare `ToTensor()`, so in $[0,1]$
+with no normalisation, and its generator presets end in a sigmoid, so their
+output is in $[0,1]$ too. The loader therefore wraps each generator $G$ as
+$$\tilde G(x) = 2\,G\!\left(\tfrac{x+1}{2}\right) - 1,$$
+which is affine and so keeps the operator differentiable for DPS. Without it,
+nothing would fail: a $[0,1]$ output passes every range check written for
+$[-1,1]$. Every image would just be read as darker and lower-contrast than the
+model produced, and every DPS gradient taken against a mis-scaled measurement.
+`probe_uvcgan.py` checks the assumption on the actual weights (raw generator
+output must stay in $[0,1]$). The loader uses the EMA generators (`avg_gen_*`),
+which is also what uvcgan2's own inference uses.
+
+The adapter also **projects its input onto the gray axis** (channel mean,
+broadcast back to 3 channels) before the generator. Every dataset image has
+$R=G=B$, so the generators never saw unequal channels, but the posterior-mean
+estimates $\hat{x}_0$ that DPS feeds the operator can have them. The projection
+is an exact no-op on dataset images and is linear, so differentiability is
+unaffected.
+
+**GAN and WGAN directories are verified, not trusted.** uvcgan2 names the
+model directory from model, discriminator, generator and label, not the loss,
+so both runs produce identically named directories that are told apart only
+by how they are renamed on upload. `run_comparison.py` reads `loss` from each
+directory's `config.json` and refuses to run if the WGAN path is not
+`loss: wgan` or the GAN path is.
 
 ### 5.1 Lattice metrics — the decisive ones
 
@@ -379,6 +502,18 @@ brightness and contrast shifts, and occluding 30% of the frame with unrelated
 texture. Median spacing error **0.0000** in every case, p90 ≤ 0.024. So the
 metric is essentially exact, and errors above ~5% indicate genuine drift.
 
+The **signature** error has a different floor, and it depends on the source
+domain (60 images per split, median / p90):
+
+| perturbation | synth sources | real sources |
+|---|---|---|
+| noise | 0 / 0.013 | 0.0003 / 0.166 |
+| 30% occlusion | 0 / 0.013 | 0.019 / 0.169 |
+
+On real sources the secondary peaks are weak, so their matching is noisy. Round-trip
+signature errors (real sources) should be read against a p90 floor of ~0.17,
+not against the synth one.
+
 **Stratification by source lattice strength.** Reported separately for sources
 above and below the median source prominence. Where the reference is so noisy
 that the lattice is barely detectable by eye, the "true" spacing is itself
@@ -440,27 +575,48 @@ $$\text{FID} = \|\mu_a-\mu_b\|_2^2 + \operatorname{Tr}\!\left(\Sigma_a + \Sigma_
 **KID** — unbiased MMD² with the polynomial kernel
 $k(x,y) = \left(\frac{x^\top y}{d}+1\right)^3$:
 
-$$\widehat{\text{MMD}}^2 = \frac{1}{m(m-1)}\sum_{i\ne j}k(x_i,x_j) + \frac{1}{m(m-1)}\sum_{i\ne j}k(y_i,y_j) - \frac{2}{mn}\sum_{i,j}k(x_i,y_j)$$
+$$\widehat{\text{MMD}}^2 = \frac{1}{|P|}\sum_{(i,j)\in P}k(x_i,x_j) + \frac{1}{n(n-1)}\sum_{i\ne j}k(y_i,y_j) - \frac{2}{mn}\sum_{i,j}k(x_i,y_j)$$
 
-averaged over random subsets, reported with the standard deviation across
-subsets.
+with $x$ the $m$ generated images, $y$ the $n$ reference images, computed once
+on the **full** sets, and $P$ the pairs of generated images that come from
+**different source inputs**.
+
+Two details matter, and both were bugs in an earlier version:
+
+- **Unequal sizes.** $m$ differs between models: 50 for a deterministic
+  translator, 200 for a DPS model with 4 variants. The estimator above is
+  unbiased for any $m \ne n$. The earlier version trimmed both sets to
+  $\min(m,n)$, so each model was scored against a different, alphabetically
+  first, slice of the reference: KID was not comparable across models.
+- **Correlated variants.** The 4 DPS variants of one input are not independent
+  samples, and their mutual kernel values inflate the first term, only for
+  stochastic models. Restricting it to cross-source pairs $P$ removes that.
+  Four identical copies of each image then score exactly the KID of the
+  originals, where before they scored ~0.1 higher.
 
 **The reference set excludes the images being scored.** In the round trip the
 sources are drawn from the same `real/val` split the reference comes from, so
 scoring against a reference containing the very images that were reconstructed
 would be optimistic. `evaluate.py` removes them before striding, so the
-reference stays at its full size and is disjoint from the run. In synth mode the
-sources are synthetic and never appear in a real reference, so nothing is
-removed.
+reference stays at its full size and is disjoint from the run. It removes every
+crop of each source **photo**, not only the source file: sibling crops are
+near-duplicates, and file-level exclusion left ~8% of the reference as siblings
+of the round-trip sources. In synth mode the sources are synthetic and never
+appear in a real reference, so nothing is removed.
 
-**On the reported KID spread.** The point estimate is computed once on the full
-sets. The `±` is the standard deviation across random subsets and should be read
-as an order-of-magnitude "differences smaller than this are noise", **not** as a
-standard error: at a few hundred images the subsets overlap heavily (100 drawn
-from 200) and are far from independent, so the spread understates the true
-uncertainty. Estimating it from disjoint subsets instead would permit only two
-subsets at $n=200$ — too few to estimate a spread at all — so the overlapping
-version is kept and labelled rather than replaced.
+**Tuning and reporting use disjoint reference halves.** The `real/val` source
+photos are split in two by a fixed hash of the photo id. The scale sweep
+(§4.1) scores KID against half A, and every reported number against half B. So
+the realism target the conditioning scale is tuned on is not the one it is
+reported against.
+
+**On the reported KID spread.** The `±` is the standard deviation over 100
+resamples. Each resample takes half of the generated **source inputs** (with all
+their variants) and a fixed 100 reference images, the same for every model, so
+the spread means the same thing for every model. Read it as an
+order-of-magnitude "differences smaller than this are noise", **not** as a
+standard error: the resamples overlap heavily and are far from independent, so
+the spread understates the true uncertainty.
 
 **Two further caveats that must appear in the report.**
 
@@ -487,10 +643,10 @@ Calibration on real data:
 
 | | pairwise RMSE |
 |---|---|
-| two crops of the **same** real photo | 0.0875 |
-| two **different** real photos | 0.1436 |
+| two crops of the **same** real photo | 0.108 |
+| two **different** real photos | 0.156–0.165 |
 
-Variants differing by much more than 0.144 are more different from each other
+Variants differing by much more than ~0.16 are more different from each other
 than two unrelated real images are — over-dispersion rather than richer realism.
 
 These reference points are measured on raw dataset PNGs, so they are only
@@ -525,7 +681,7 @@ Distinguish by looking at the nearest-neighbour pairs.
 
 | | input | ground truth | metrics |
 |---|---|---|---|
-| **round trip** | $y = G_{R\to S}(r)$ for real $r$ | $r$ itself | all, including paired |
+| **round trip** | $y = G_{R\to S}(r)$ for real $r$, one fixed builder | $r$ itself | all, including paired |
 | **synth** | $y = s$, a real synthetic image | none | all except paired |
 
 The round trip exists because it is the only way to obtain paired ground truth.
@@ -533,16 +689,33 @@ The synth experiment is the actual deliverable.
 
 ### 6.2 Biases that must be reported
 
-**The round trip structurally favours `uvcgan`.** $G_{S\to R}$ was trained with a
-cycle-consistency loss to invert $G_{R\to S}$ — it was explicitly optimised for
-this task. A DPS win here is therefore strong evidence; a DPS loss is not
-damning.
+**A round trip favours whichever UVCGAN built the measurement.** Within one
+round trip all five models receive the same $y$, built by one fixed
+$R\to S$ generator (the *builder*), because otherwise the comparison is not
+like-for-like. That builder's own $G_{S\to R}$ was trained with a
+cycle-consistency loss to invert exactly that $G_{R\to S}$, so it was
+explicitly optimised for this task. A DPS win over it is therefore strong
+evidence, and a DPS loss is not damning.
 
-**`dps_analytic` receives a mismatched measurement.** All three models get the
-same $y$, built by the same $R\to S$ model, because otherwise the comparison is
-not like-for-like. But `dps_analytic` inverts an operator that did not produce
-that $y$. This is not a flaw in the design — it *is* what the ablation measures:
-how much is lost by not having a trained translation model.
+**The other models receive a mismatched measurement.** With the GAN builder,
+`uvcgan_wgan` translates and `dps_uvcgan_wgan` inverts through a model that did
+not produce $y$. For `dps_analytic` this is the point of the ablation: it
+measures how much is lost by not having a trained translation model. For GAN vs
+WGAN, though, a single builder is a **confound**: it cannot separate "WGAN is
+worse" from "WGAN was not the builder".
+
+**Hence the round trip is run once per builder** (`roundtrip_uvcgan_gan` and
+`roundtrip_uvcgan_wgan`). Each UVCGAN pair is then measured once with its own
+generator as the builder and once with the other one's, so the GAN vs WGAN
+comparison is symmetric. The gap between a model's two round-trip scores shows
+how much of its round-trip advantage comes from the builder. `dps_analytic` is
+mismatched in both, so the two tables also show how sensitive the analytic
+ablation is to which trained model produced $y$. The synth experiment has no
+builder and so no such bias, which is another reason it carries the headline
+result.
+
+The conditioning scale involves no builder at all: it is tuned on synthetic
+inputs (§4.1), so neither round trip influences it.
 
 ### 6.3 Sampling hygiene
 
@@ -561,8 +734,15 @@ invalidates every validation number and specifically breaks the memorisation
 check, since a "held-out" image whose siblings were trained on looks memorised
 regardless.
 
-**All models see the identical subset**, which is what makes a figure row and a
+**All five models see the identical subset**, which is what makes a figure row and a
 metric table row a like-for-like comparison.
+
+**Tuning and test data are disjoint.** The scale sweep draws its inputs from
+`synth/train` and scores realism against half A of the `real/val` photos; the
+final experiments draw from `synth/val` and `real/val` and score against half B. An
+earlier version tuned on a strided subset of the same `real/val` list the final
+round trip used, and the two subsets shared images (the 24- and 50-image
+strided lists both contain indices $0$ and $N/2$).
 
 ---
 
@@ -578,6 +758,20 @@ metric table row a like-for-like comparison.
   a reviewer asks, re-running a handful of images at 1000 steps and comparing is
   cheap.
 - FID at $n \lesssim 2000$ is not trustworthy (§5.4); lead with KID.
+- The lattice metric searches periods up to $n/4 = 40$ px, so a true spacing
+  at or above ~40 px reads as ~40 px and drift beyond it is invisible. About
+  15% of real sources have spacings ≥ 36 px (2% at the bound); synthetic ones
+  are almost all well inside it. Raising the bound would let the illumination
+  blob near DC compete with the lattice peak (§2.3), so it is stated as a
+  limitation instead.
+- The conditioning scale is tuned on synthetic inputs and reused for the round
+  trips, whose measurements come from a different distribution (§4). The
+  selection rule's thresholds (signature error 0.05, 0.98 × the memorisation
+  floor) are principled but still choices. Sweep tables for every model are
+  reported so a reader can check that the ranking does not hinge on them.
+- The sweep uses 48 samples per scale, so KID differences between adjacent
+  scales are often within noise. The rule handles this by deferring to label
+  validity, but a finer optimum than the grid resolution is not claimed.
 - The synth dataset used 15 000 images from one of ten available shards. Since
   the shards are a size-based split of a randomly ordered set, this is a
   representative sample rather than a restricted region of parameter space — but

@@ -31,6 +31,7 @@ wrong frame. What matters instead:
 import argparse
 import csv
 import os
+import zlib
 from collections import Counter, defaultdict
 from glob import glob
 
@@ -78,7 +79,22 @@ def read_gray(path, image_size=DEFAULT_IMAGE_SIZE):
     return np.asarray(img, dtype=np.float64) / 255.0
 
 
-def load_dir(root, limit=None, exclude=None):
+def photo_id(path):
+    """Source photo of a crop: '<photo>_sample_<k>.png' -> '<photo>'."""
+    return os.path.basename(path).split('_sample_')[0]
+
+
+def reference_half(path):
+    """'A' or 'B', fixed per source PHOTO (crc32, so stable across runs).
+
+    The scale sweep scores KID against half A and the final experiments
+    against half B, so the realism target the scale is tuned on is disjoint,
+    down to the photo, from the one it is reported against.
+    """
+    return 'AB'[zlib.crc32(photo_id(path).encode()) & 1]
+
+
+def load_dir(root, limit=None, exclude=None, half=None):
     """Sorted PNGs, subsampled by even stride rather than truncation.
 
     Crops are named "<photo>_sample_<k>", so paths[:limit] collapses onto the
@@ -86,13 +102,20 @@ def load_dir(root, limit=None, exclude=None):
     distinct scenes instead of 500.
 
     `exclude` drops paths before striding, so the returned set is still `limit`
-    images. Used to keep the realism reference disjoint from the images being
-    scored -- see collect_evaluated_sources.
+    images. It removes every crop of each excluded image's source PHOTO, not
+    just the file itself: sibling crops of a scored source are near-duplicates
+    of it, and keeping them left ~8% of the reference as siblings of the
+    round-trip sources. Used to keep the realism reference disjoint from the
+    images being scored -- see collect_evaluated_sources.
+
+    `half` ('A'/'B') keeps only that half of the source photos.
     """
     paths = sorted(glob(os.path.join(root, '**', '*.png'), recursive=True))
     if exclude:
-        excl = {os.path.abspath(p) for p in exclude}
-        paths = [p for p in paths if os.path.abspath(p) not in excl]
+        excl = {photo_id(p) for p in exclude}
+        paths = [p for p in paths if photo_id(p) not in excl]
+    if half:
+        paths = [p for p in paths if reference_half(p) == half]
     if not paths:
         raise ValueError(f'No PNGs under {root}')
     if limit and limit < len(paths):
@@ -295,6 +318,11 @@ def parse_args():
     p.add_argument('--limit_reference', type=int, default=500,
                    help='Realism reference set size. Bounded because each image '
                         'costs an FFT.')
+    p.add_argument('--reference_half', choices=['A', 'B'], default=None,
+                   help='Use only half of the reference source photos (fixed '
+                        'split by photo id). The scale sweep tunes against A, '
+                        'the final experiments report against B, so the scale '
+                        'is not tuned on the realism target it is scored on.')
     p.add_argument('--limit_memorisation', type=int, default=None,
                    help='Training images for the NN check. Defaults to ALL of '
                         'them: a generated image can copy any training image, '
@@ -309,6 +337,13 @@ def parse_args():
     return p.parse_args()
 
 
+def _eval_device():
+    """GPU when there is one. Inception and LPIPS on CPU made each evaluation
+    of a sweep take ~20 min while a Colab GPU sat idle."""
+    import torch
+    return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
 def main():
     args = parse_args()
 
@@ -319,15 +354,19 @@ def main():
     logger.info(f'Reference (real) set: {args.real_root} '
                 f'(all images measured at {args.image_size}px)')
     real_paths = load_dir(args.real_root, args.limit_reference,
-                          exclude=evaluated)
+                          exclude=evaluated, half=args.reference_half)
+    if args.reference_half:
+        logger.info(f'  reference half {args.reference_half} (by source photo)')
     # Count what was actually removed rather than inferring it from directory
     # names, which breaks for a trailing slash or images in a subdirectory
     # (load_dir globs recursively).
-    n_excluded = sum(1 for p in load_dir(args.real_root)
-                     if os.path.abspath(p) in evaluated)
+    excluded_photos = {photo_id(p) for p in evaluated}
+    n_excluded = sum(1 for p in load_dir(args.real_root, half=args.reference_half)
+                     if photo_id(p) in excluded_photos)
     if n_excluded:
-        logger.info(f'  excluded {n_excluded} image(s) that these runs were '
-                    'derived from, keeping the reference disjoint')
+        logger.info(f'  excluded {n_excluded} image(s) from the source photos '
+                    'these runs were derived from, keeping the reference '
+                    'disjoint')
     real = summarise_reference(real_paths, args.image_size)
     logger.info(f'  {real["n"]} images, '
                 f'prominence median {real["prominence_median"]:.1f} '
@@ -351,12 +390,12 @@ def main():
     if args.lpips:
         from util.image_metrics import LPIPS
         logger.info('Loading LPIPS (first use downloads weights)')
-        lpips_model = LPIPS()
+        lpips_model = LPIPS(device=_eval_device())
 
     inception, real_feats = None, None
     if args.fid_kid:
         logger.info('Loading InceptionV3 for FID/KID')
-        inception = InceptionFeatures()
+        inception = InceptionFeatures(device=_eval_device())
         real_feats = inception(read_gray(p, args.image_size) for p in real_paths)
         logger.info(f'  reference features: {real_feats.shape}')
 
@@ -408,6 +447,12 @@ def main():
                 [r['src_prominence'] for r in records])),
             'spectrum_dist_to_real': profile_distance(mean_profile, real['profile']),
             'diversity_rmse': diversity(records, args.image_size),
+            # The reference points the table is read against, stored alongside
+            # so a summary CSV can be judged on its own (run_comparison's
+            # automatic scale selection reads them from here).
+            'real_prominence_median': real['prominence_median'],
+            'nn_floor': (float(np.median(real_nn)) if ref_feats is not None
+                         else None),
         }
 
         # Paired metrics exist only where the manifest carried a ground truth.
@@ -418,9 +463,12 @@ def main():
         if inception is not None:
             gen_feats = inception(read_gray(r['_path'], args.image_size)
                                   for r in records)
+            # Full reference, same reference subset size for every model, and
+            # the source of each image so DPS variants of one input are not
+            # counted as independent samples (see kernel_distance).
             kid_mean, kid_std = kernel_distance(
-                gen_feats, real_feats,
-                subset_size=min(100, len(gen_feats), len(real_feats)))
+                gen_feats, real_feats, subset_size=100,
+                groups_a=[r['source_image'] for r in records])
             summary['kid'] = kid_mean
             summary['kid_std'] = kid_std
             summary['fid'] = frechet_distance(gen_feats, real_feats)
@@ -442,17 +490,21 @@ def main():
     for s in summaries:
         label = (s['model'] if counts[s['model']] == 1
                  else os.path.basename(os.path.normpath(s['result_dir'])))
-        s['label'] = label[:14]
+        s['label'] = label
+
+    # Columns sized to the longest label (e.g. dps_uvcgan_wgan) rather than
+    # truncating, which could make two models' columns indistinguishable.
+    col = max([15] + [len(s['label']) + 2 for s in summaries])
 
     print()
-    width = 32 + 15 * len(summaries) + 20
+    width = 32 + col * len(summaries) + 20
     print('=' * width)
-    print(f'{"metric":<32}' + ''.join(f'{s["label"]:>15}' for s in summaries))
+    print(f'{"metric":<32}' + ''.join(f'{s["label"]:>{col}}' for s in summaries))
     print('=' * width)
 
     def row(label, key, fmt='{:.4f}', note=''):
         vals = ''.join(
-            f'{(fmt.format(s[key]) if s.get(key) is not None else "n/a"):>15}'
+            f'{(fmt.format(s[key]) if s.get(key) is not None else "n/a"):>{col}}'
             for s in summaries)
         print(f'{label:<32}{vals}   {note}')
 

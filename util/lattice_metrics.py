@@ -216,9 +216,16 @@ def signature_distance(sig_a: list, sig_b: list) -> float:
     for pa in sig_a:
         va = _reciprocal_vector(pa)
         scale = np.linalg.norm(va) or 1.0
-        best = min(remaining,
-                   key=lambda pb: float(
-                       np.linalg.norm(_reciprocal_vector(pb) - va) / scale))
+        # min over +/-: a peak and its centrosymmetric mirror are the same
+        # lattice vector. Without it a peak at 2 deg and one at 178 deg (4 deg
+        # apart) sat ~2r apart in the upper-half-plane representation and got
+        # mismatched -- sig_err 0.73 for a 4 deg rotation across the seam,
+        # versus ~0.005 for the same rotation anywhere else.
+        def dist(pb, va=va, scale=scale):
+            vb = _reciprocal_vector(pb)
+            return float(min(np.linalg.norm(vb - va),
+                             np.linalg.norm(vb + va)) / scale)
+        best = min(remaining, key=dist)
         errors.append(spacing_error(best['spacing_px'], pa['spacing_px']))
         if len(remaining) > 1:
             remaining.remove(best)
