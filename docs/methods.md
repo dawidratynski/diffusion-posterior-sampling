@@ -91,29 +91,31 @@ DFT and $F = \mathcal{F}(x)$, with frequencies centred (fftshift) so that the
 DC component sits at the array centre. Let $r(u,v)=\sqrt{u^2+v^2}$ be the radius
 in cycles-per-image of frequency bin $(u,v)$, and $n=\min(H,W)$.
 
-**Step 1 — peak sharpening.** With $M = |F|$ and $M_{\max}$ its maximum over
-spatial frequencies (per image and channel),
+**Step 0 — remove brightness.** Subtract the image mean $\bar{x}$ (over all
+channels and pixels), so that $F = \mathcal{F}(x - \bar{x})$ has no DC term.
 
-$$W_{\text{sharp}}(u,v) \;=\; \left(\frac{M(u,v)}{M_{\max}}\right)^{\gamma}$$
-
-**Step 2 — band-pass.** With $\rho_{\min}, \rho_{\max}$ the smallest and largest
+**Step 1 — band-pass.** With $\rho_{\min}, \rho_{\max}$ the smallest and largest
 lattice periods to retain (defaults 4 px and 37.5 px) and $\sigma$ a softness
 parameter (default 1.5):
 
 $$W_{\text{band}}(u,v) \;=\; \mathrm{sigmoid}\!\left(\frac{r - n/\rho_{\max}}{\sigma}\right) \cdot \mathrm{sigmoid}\!\left(\frac{n/\rho_{\min} - r}{\sigma}\right)$$
 
-**Step 3 — inverse transform.**
+**Step 2 — peak sharpening, relative to the strongest lattice peak.** With
+$M = |F|$ and $M_{\max} = \max_{u,v} M(u,v)\,W_{\text{band}}(u,v)$ (per image),
 
-$$\tilde{x} \;=\; \Re\,\mathcal{F}^{-1}\!\big(F \cdot W_{\text{sharp}} \cdot W_{\text{band}}\big)$$
+$$W_{\text{sharp}}(u,v) \;=\; \left(\frac{M(u,v)}{M_{\max}}\right)^{\gamma}, \qquad
+\tilde{x} \;=\; \Re\,\mathcal{F}^{-1}\!\big(F \cdot W_{\text{sharp}} \cdot W_{\text{band}}\big)$$
 
-**Step 4 — domain renormalisation.** With $\mu,\sigma_x$ the mean and standard
-deviation of $\tilde{x}$ over all channels and pixels, and $(\mu_S,\sigma_S)$ the
-measured synth-domain statistics:
+**Step 3 — map to synthetic intensity, with a fixed gain.**
 
-$$A(x) \;=\; \mathrm{clip}_{[-1,1]}\!\left(\frac{\tilde{x}-\mu}{\sigma_x}\,\sigma_S + \mu_S\right)$$
+$$A(x) \;=\; \mathrm{clip}_{[-1,1]}\!\left(g\,\tilde{x} + \mu_S\right)$$
 
-Defaults $\mu_S = 0.47$, $\sigma_S = 0.38$, from the synth split: mean pixel
-value $188.2/255$ and std $49.1/255$, mapped to $[-1,1]$.
+$\mu_S = 0.47$ is the synthetic mean (mean pixel value $188.2/255$, mapped to
+$[-1,1]$). The gain $g = 5.261$ is calibrated **once**: it is the value at which
+a typical real image comes out with synthetic contrast, i.e. median per-image
+std of $g\tilde{x}$ equal to $\sigma_S = 0.38$ (std $49.1/255$), over 400 strided
+`real/train` images (`SpectralIdealizer.calibrate_gain`). The calibration set is
+the training split, disjoint from everything evaluated.
 
 ### 2.3 Why each step
 
@@ -129,16 +131,31 @@ mask. A discrete mask would make $A$ piecewise constant in $x$, giving
 discontinuous jumps in the DPS gradient. Smoothness here is a requirement, not
 an aesthetic choice (see §4).
 
-**The band-pass** removes two things. Below $n/\rho_{\max}$ lie DC and slow
+**Removing the mean first** puts brightness exactly in the null space, by
+construction rather than approximately (§2.5).
+
+**The band-pass** removes two things. Below $n/\rho_{\max}$ lie slow
 illumination gradients, which carry **42% of total power** in real micrographs
-(measured: radius ≤3 of a 150-px FFT) and would otherwise dominate the
-sharpening step's $M_{\max}$. Above $n/\rho_{\min}$ lies near-Nyquist pixel
-noise. Sigmoid rather than brick-wall edges, because a sharp cutoff causes
+(measured: radius ≤3 of a 150-px FFT). Above $n/\rho_{\min}$ lies near-Nyquist
+pixel noise. Sigmoid rather than brick-wall edges, because a sharp cutoff causes
 ringing (Gibbs) and, again, a non-smooth gradient.
 
-**Renormalisation** is needed because the two domains have very different
-intensity statistics — real images are dark (mean $-0.52$ in $[-1,1]$), synth
+**Sharpening is relative to the strongest *lattice* peak** ($M_{\max}$ taken
+inside the band), so the reference point is the lattice itself, not
+illumination or brightness.
+
+**The intensity mapping** is needed because the two domains have very different
+intensity statistics: real images are dark (mean $-0.52$ in $[-1,1]$), synth
 bright (mean $+0.47$). Without it, $A$'s output would not resemble $S$ at all.
+**The gain is fixed** rather than each image's own contrast. An earlier version
+divided by the per-image std of $\tilde{x}$. That made $A$ contrast-invariant,
+so the DPS gradient scaled with $1/\text{contrast}$: 13.6× larger on a faint
+early estimate than on a synthetic-looking image, which drove samples into the
+sampler's clamp (near-black outputs, §4.2). With a fixed gain the output
+contrast is simply proportional to the input's lattice contrast, and that spread
+is 2.1×. Neither change alters the output's shape, so the $\gamma$ calibration
+of §2.4 still holds. On real images, output prominence is 18033 vs 17438 before,
+std 0.352 vs 0.353, and mean 0.453 vs 0.455.
 
 ### 2.4 Calibration of $\gamma$
 
@@ -162,10 +179,11 @@ label-validity metric measures.
 
 - **Deterministic.** DPS's likelihood approximation assumes a deterministic $A$.
 - **Differentiable.** Required; see §4.
-- **Brightness lies in its null space.** Step 2 removes DC and step 4
-  renormalises, so *any* input mean maps to the same output mean (verified:
-  inputs ranging over mean $-0.92$ to $+0.11$ all map to output mean $\approx
-  +0.44$). Consequently the data-consistency term exerts **zero gradient** on
+- **Output contrast is proportional to input lattice contrast** (fixed gain),
+  so faint and sharp estimates get comparable guidance (§2.3).
+- **Brightness lies in its null space, exactly.** Step 0 removes the mean, so
+  $A(x + c) = A(x)$ for any constant $c$ (verified to $4\times10^{-7}$).
+  Consequently the data-consistency term exerts **zero gradient** on
   output brightness, which is supplied entirely by the prior. Observed
   decorrelation between input and output brightness is therefore expected
   behaviour, not a defect — and for augmentation it is desirable, since
@@ -389,9 +407,12 @@ angle ≤ 3°), but its outputs turned nearly black (KID 0.09–0.17). Its gradi
 is well-behaved spectrally (93% of its energy in the lattice band), but its size
 scales with $1/\text{contrast}$: 0.37 for a synthetic-looking image, 2.0 for a
 real one, 6.8 for a faint early estimate, an 18× spread. It comes from the
-operator's per-image contrast normalisation (§2.2, step 4). The likely result is
+operator's then per-image contrast normalisation. The likely result is
 overshoot into the sampler's clamp at −1, which the dark real-domain prior is
-close to. This is a likely mechanism, not a verified one.
+close to. **The operator was redefined accordingly** (fixed gain, §2.2–2.3),
+which cuts the spread to ~2×. These numbers describe the earlier definition;
+whether the black outputs are gone is answered by the sweep with the current
+one.
 
 ---
 

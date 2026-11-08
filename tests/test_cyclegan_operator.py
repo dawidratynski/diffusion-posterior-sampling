@@ -227,3 +227,62 @@ def test_no_placeholder_framework_is_registered():
     assert set(__LOADER__) == {"uvcgan2", "cyclegan_resnet", "torchscript",
                                "spectral"}, (
         f"unexpected framework registered: {sorted(__LOADER__)}")
+
+
+def _spectral_lattice(period=20.0, angle=20.0, n=160, contrast=1.0, mean=0.0,
+                      seed=0):
+    """A noisy 2-vector lattice in [-1, 1]-ish, like a real crop."""
+    yy, xx = np.mgrid[0:n, 0:n].astype(np.float64)
+    img = sum(np.cos(2 * np.pi * (xx * np.cos(np.radians(a))
+                                  + yy * np.sin(np.radians(a))) / period)
+              for a in (angle, angle + 60))
+    img = img / np.abs(img).max() * 0.3 * contrast + mean
+    img = img + np.random.default_rng(seed).normal(0, 0.1, img.shape)
+    return torch.from_numpy(img).float().expand(1, 3, n, n).clone()
+
+
+def test_spectral_operator_ignores_brightness_exactly():
+    """Brightness is in the null space by construction (mean removed first)."""
+    op = get_operator(name="cyclegan", device="cpu", framework="spectral",
+                      direction="ba", gamma=0.4)
+    x = _spectral_lattice(mean=-0.5)
+    assert torch.allclose(op.forward(x), op.forward(x + 0.35), atol=1e-5)
+
+
+def test_spectral_output_contrast_is_proportional_to_input():
+    """Fixed gain: half the lattice contrast in -> half the contrast out."""
+    from guided_diffusion.cyclegan_loader import SpectralIdealizer
+    op = SpectralIdealizer()
+    x = _spectral_lattice()
+    a, b = op.idealise(x), op.idealise(x * 0.5)
+    assert torch.allclose(b, a * 0.5, atol=1e-5)
+
+
+def test_spectral_guidance_does_not_blow_up_on_faint_images():
+    """Per-image contrast normalisation made the DPS gradient scale with
+    1/contrast (13.6x spread; near-black outputs). With the fixed gain a faint
+    estimate must not get a much larger push than a normal one."""
+    op = get_operator(name="cyclegan", device="cpu", framework="spectral",
+                      direction="ba", gamma=0.4)
+    # contrast 0.6 gives real-like output contrast (std ~0.35, target 0.38).
+    y = op.forward(_spectral_lattice(contrast=0.6, seed=1)).detach()
+
+    def grad_norm(x):
+        x = x.clone().requires_grad_()
+        (g,) = torch.autograd.grad(torch.linalg.norm(y - op.forward(x)), x)
+        return float(g.norm())
+
+    normal = grad_norm(_spectral_lattice(contrast=0.6, seed=2))
+    faint = grad_norm(_spectral_lattice(contrast=0.15, seed=2))
+    # Measured: fixed gain 2.45x; the old per-image normalisation 6.43x.
+    assert faint < 3.5 * normal, (faint, normal)
+
+
+def test_spectral_gain_calibration_hits_its_target():
+    from guided_diffusion.cyclegan_loader import SpectralIdealizer
+    imgs = torch.cat([_spectral_lattice(seed=s, contrast=0.5 + 0.1 * s)
+                      for s in range(9)])
+    gain = SpectralIdealizer.calibrate_gain(imgs, target_std=0.38)
+    op = SpectralIdealizer(gain=gain)
+    stds = (op.idealise(imgs) * gain).std(dim=(-3, -2, -1))
+    assert abs(float(stds.median()) - 0.38) < 1e-4

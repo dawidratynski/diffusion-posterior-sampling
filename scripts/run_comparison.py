@@ -94,6 +94,11 @@ RS_MODELS = {
 }
 
 
+# Bump whenever SpectralIdealizer's definition changes, so cached results made
+# with the old operator are not reused (the run signature does not hash code).
+SPECTRAL_OPERATOR_VERSION = 'v2-fixed-gain'
+
+
 def weight_paths(args):
     '''{'gan': path-or-None, 'wgan': path-or-None}, None where absent.'''
     given = {'gan': args.uvcgan_gan_path, 'wgan': args.uvcgan_wgan_path}
@@ -280,6 +285,12 @@ def run_signature(model, args, paths, input_mode, rs_model, scale, samples,
         # only ever fed the generator exactly-gray dataset images.
         **({'operator_input': 'unmodified'}
            if is_dps and model['dps_framework'] == 'uvcgan2' else {}),
+        # The analytic operator's definition changed (fixed gain, sharpening
+        # relative to the strongest lattice peak); runs made with an earlier
+        # definition carry no / another version and regenerate.
+        **({'spectral_operator': SPECTRAL_OPERATOR_VERSION}
+           if (is_dps and model['dps_framework'] == 'spectral')
+           or (roundtrip and rs_model == 'spectral') else {}),
     }
 
 

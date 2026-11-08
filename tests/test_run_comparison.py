@@ -527,3 +527,20 @@ def test_dps_uvcgan_runs_from_the_gray_projection_era_regenerate(tmp_path):
     assert sig("dps_uvcgan_gan")["operator_input"] == "unmodified"
     assert "operator_input" not in sig("dps_analytic")
     assert "operator_input" not in sig("uvcgan_gan")
+
+
+def test_analytic_operator_runs_carry_its_version(tmp_path):
+    """Changing the analytic operator must invalidate its cached runs --
+    whether it is the DPS operator or the round-trip measurement builder."""
+    args, paths = _setup(tmp_path, gan=True)
+
+    def sig(label, mode, rs=None):
+        m = next(x for x in rc.MODELS if x["label"] == label)
+        return rc.run_signature(m, args, paths, mode, rs, 1.0, 2, 3)
+
+    v = rc.SPECTRAL_OPERATOR_VERSION
+    assert sig("dps_analytic", "synth")["spectral_operator"] == v
+    assert sig("uvcgan_gan", "roundtrip", "spectral")["spectral_operator"] == v
+    assert "spectral_operator" not in sig("dps_uvcgan_gan", "synth")
+    assert "spectral_operator" not in sig("uvcgan_gan", "roundtrip",
+                                          "uvcgan_gan")

@@ -251,52 +251,71 @@ def load_torchscript(direction: str, path: str):
 # does, give it a name that cannot be mistaken for a real one.
 
 
+# Gain of step 4, calibrated ONCE with SpectralIdealizer.calibrate_gain on 400
+# strided real/train images at 160 px (median output std = target_std). The
+# calibration set is the training split, disjoint from everything evaluated.
+SPECTRAL_GAIN = 5.261
+
+
 class SpectralIdealizer(nn.Module):
     '''An analytic, untrained stand-in for the real -> synth generator.
 
     Real crops are a lattice buried in noise, aperiodic clutter and a strong
     illumination gradient; synthetic ones are clean, bright and near-perfectly
-    periodic. This caricatures that mapping with three spectral operations:
+    periodic. This caricatures that mapping in four steps (methods §2.2):
 
-      1. a high-pass that removes the illumination blob (42% of real power sits
-         at radius <= 3, measured on the dataset),
-      2. peak sharpening `F <- F * (|F|/max|F|)^gamma`, which raises coherent
-         lattice peaks above the incoherent floor -- gamma=0 is the identity,
-         larger gamma drives the output toward perfect periodicity. gamma is
-         calibrated so the output's peak prominence matches the SYNTH domain,
-         which is what a real G_{R->S} emits; measured on the real val split:
+      0. remove brightness: subtract the image mean, so the spectrum has no DC
+         term. Brightness is therefore exactly in the operator's null space.
+      1. band-pass to lattice periods min_period..max_period px: removes the
+         slow illumination blob (42% of real power sits at radius <= 3) and
+         near-Nyquist pixel noise,
+      2. peak sharpening F <- F * (|F| / max_band |F|)^gamma, relative to the
+         strongest LATTICE peak: raises coherent lattice peaks above the
+         incoherent floor. gamma=0 is the identity; larger gamma drives the
+         output toward perfect periodicity. gamma is calibrated so the output's
+         peak prominence matches the SYNTH domain, which is what a real G_{R->S}
+         emits; measured on the real val split:
 
              gamma      0.0    0.15   0.25   0.40   0.60    1.00
              prominence 987    2433   4134   9496   31960   243547
              synth domain median: 12197
 
-         0.4 lands closest. The original 1.0 overshot by 20x, making the
-         stand-in far harsher than the operator it stands in for -- and it also
-         started to disturb the lattice itself (median spacing error 0.023 at
-         gamma 1.0 versus 0.000 at 0.4),
-      3. renormalisation to the synthetic domain's intensity statistics.
+         0.4 lands closest; 1.0 overshot by 20x and started to disturb the
+         lattice itself (median spacing error 0.023 vs 0.000 at 0.4),
+      3. map to the synthetic domain's intensity: multiply by a FIXED gain and
+         add the synthetic mean. The gain is calibrated once so a typical real
+         image comes out with synthetic contrast (target_std 0.38).
 
-    Purpose: end-to-end runs before UVCGAN weights exist. It needs no training,
-    is deterministic, and is smooth in x (the sharpening weight is a continuous
-    function of the spectrum, not a top-k mask, so no discontinuous jumps in the
-    DPS gradient). Like a real G_{R->S} it discards imperfections, so its null
-    space is the imperfection manifold DPS is meant to resample -- which is what
-    makes it a useful rehearsal rather than just a placeholder.
+    Why a fixed gain, not each image's own contrast: dividing by the image's
+    std made the DPS guidance gradient scale with 1/contrast -- 13.6x larger
+    on a faint early estimate than on a synthetic-looking image -- which drove
+    pixels into the sampler's clamp (near-black outputs). With a fixed gain the
+    output contrast is simply proportional to the input's lattice contrast and
+    the spread is 2.1x. Step 2 is relative to the strongest LATTICE peak (not
+    the overall maximum, which was the brightness term) for the same reason:
+    so the result does not depend on brightness. Neither changes the output's
+    shape, so the gamma calibration above still holds (real images: output
+    prominence 18033 vs 17438 before, std 0.352 vs 0.353, mean 0.453 vs 0.455).
 
-    NOT a substitute for the trained model in any reported result.
+    Deterministic, differentiable and smooth in x (the sharpening weight is a
+    continuous function of the spectrum, not a top-k mask). Like a real G_{R->S}
+    it discards imperfections, so its null space is the imperfection manifold
+    DPS is meant to resample.
+
+    It is the "no trained translation model" ablation, not a substitute for
+    the trained generators.
     '''
 
     def __init__(self, gamma: float = 0.4, min_period: float = 4.0,
                  max_period: float = 37.5, target_mean: float = 0.47,
-                 target_std: float = 0.38, softness: float = 1.5):
+                 gain: float = SPECTRAL_GAIN, softness: float = 1.5):
         super().__init__()
         self.gamma = gamma
         self.min_period = min_period
         self.max_period = max_period
-        # Synthetic-domain statistics in [-1, 1]: measured mean 188/255 and
-        # std 49/255 over the synth split.
+        # Synthetic-domain mean in [-1, 1]: measured 188/255 over the synth split.
         self.target_mean = target_mean
-        self.target_std = target_std
+        self.gain = gain
         self.softness = softness
 
     def _bandpass(self, h, w, device, dtype):
@@ -311,30 +330,39 @@ class SpectralIdealizer(nn.Module):
                 * torch.sigmoid((hi - r) / self.softness))
         return band.to(dtype)
 
-    def forward(self, x):
+    def idealise(self, x):
+        '''Steps 0-2: the brightness-free, sharpened lattice component.'''
         h, w = x.shape[-2:]
+        x = x - x.mean(dim=(-3, -2, -1), keepdim=True)                    # 0
+        band = self._bandpass(h, w, x.device, x.dtype)                     # 1
         spec = torch.fft.fftshift(torch.fft.fft2(x), dim=(-2, -1))
-
         mag = spec.abs()
-        peak = mag.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-8)
+        peak = (mag * band).amax(dim=(-2, -1), keepdim=True).clamp_min(1e-8)
         # clamp_min: d/dm m^gamma is infinite at m = 0 for gamma < 1, so an
-        # exactly-zero bin (flat or perfectly periodic x0_hat) made the DPS
-        # gradient NaN. 1e-6 of the peak is far below any bin that matters.
-        weight = (mag / peak).clamp_min(1e-6) ** self.gamma
-        spec = spec * weight * self._bandpass(h, w, x.device, weight.dtype)
+        # exactly-zero bin would make the DPS gradient NaN. 1e-6 of the peak
+        # is far below any bin that matters.
+        weight = (mag / peak).clamp_min(1e-6) ** self.gamma                # 2
+        spec = spec * weight * band
+        return torch.fft.ifft2(torch.fft.ifftshift(spec, dim=(-2, -1))).real
 
-        out = torch.fft.ifft2(torch.fft.ifftshift(spec, dim=(-2, -1))).real
-
-        mean = out.mean(dim=(-3, -2, -1), keepdim=True)
-        std = out.std(dim=(-3, -2, -1), keepdim=True).clamp_min(1e-6)
-        out = (out - mean) / std * self.target_std + self.target_mean
+    def forward(self, x):
+        out = self.idealise(x) * self.gain + self.target_mean              # 3
         return out.clamp(-1.0, 1.0)
+
+    @classmethod
+    @torch.no_grad()
+    def calibrate_gain(cls, real_images, target_std: float = 0.38, **kwargs):
+        '''The step-3 gain that gives a typical real image synthetic contrast:
+        target_std / median per-image std of idealise(real). How
+        SPECTRAL_GAIN was obtained (real/train, 400 strided images, 160 px).'''
+        stds = cls(**kwargs).idealise(real_images).std(dim=(-3, -2, -1))
+        return float(target_std / stds.median())
 
 
 @register_loader('spectral')
 def load_spectral(direction: str, gamma: float = 0.4, min_period: float = 4.0,
                   max_period: float = 37.5, target_mean: float = 0.47,
-                  target_std: float = 0.38, softness: float = 1.5):
+                  gain: float = SPECTRAL_GAIN, softness: float = 1.5):
     if direction != 'ba':
         raise ValueError(
             'SpectralIdealizer only models real -> synth (direction: ba). '
@@ -342,4 +370,4 @@ def load_spectral(direction: str, gamma: float = 0.4, min_period: float = 4.0,
             'use the trained generator for the baseline.')
     return SpectralIdealizer(gamma=gamma, min_period=min_period,
                              max_period=max_period, target_mean=target_mean,
-                             target_std=target_std, softness=softness)
+                             gain=gain, softness=softness)
