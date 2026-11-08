@@ -87,12 +87,10 @@ class UnitRangeAdapter(nn.Module):
         self.source = source  # human-readable provenance, printed by the probe
 
     def forward(self, x):
-        # Every training image is grayscale stored as RGB (R=G=B, verified on
-        # the whole dataset), so the generator never saw unequal channels. The
-        # DPS posterior-mean estimates it receives can have them, so project
-        # onto the gray axis first. Exact no-op on dataset images; linear, so
-        # it keeps the operator differentiable.
-        x = x.mean(dim=1, keepdim=True).expand_as(x)
+        # Range conversion ONLY. The trained generator must be used exactly as
+        # trained (the comparison is standard DPS + UVCGAN vs UVCGAN), so no
+        # other input processing -- e.g. projecting channels to gray -- belongs
+        # here.
         return self.generator((x + 1.0) / 2.0) * 2.0 - 1.0
 
 

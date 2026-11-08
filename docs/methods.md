@@ -39,10 +39,14 @@ $R$ conditioned through $G_{R\to S}$.
 ### The five models compared
 
 Two UVCGAN models are trained, identical except for the adversarial loss:
-the least-squares GAN objective (LSGAN, `loss: lsgan` in
-`uvcgan_training/train_crystals.py`, uvcgan2's default; note this is not the
-original BCE "vanilla" GAN loss, so "GAN" below means LSGAN) and
-a Wasserstein GAN objective. Write $G^{\text{gan}}$ and $G^{\text{wgan}}$ for
+the least-squares GAN objective (LSGAN, `loss: lsgan`, uvcgan2's default; note
+this is not the original BCE "vanilla" GAN loss, so "GAN" below means LSGAN) and
+a Wasserstein GAN objective. The trained GAN model's own `config.json` records
+the setup actually used, which differs from `uvcgan_training/train_crystals.py`
+in the sibling repo: 500 epochs, identity-loss weight `lambda_idt` 0.05,
+uvcgan2's `image-domain-hierarchy` loader on a `crystal160` dataset, and
+**real as domain a** (the loader maps generators by domain name, §5.0).
+*TODO: confirm the WGAN run's settings and how `crystal160` was produced.* Write $G^{\text{gan}}$ and $G^{\text{wgan}}$ for
 their generators. Each is used both directly and as a DPS operator:
 
 | label | definition | stochastic |
@@ -315,26 +319,33 @@ all scales are judged against the same reference statistics.
 
 **Selection rule.**
 
-1. *Admissible* scales must satisfy both
-   $$\text{signature error (median)} \le 0.05 \qquad\text{and}\qquad
+1. *Admissible* scales must satisfy all of
+   $$\text{spacing error (median)} \le 0.05,\quad
+     \text{angle error (median)} \le 5^\circ,\quad
      \text{NN distance (median)} \ge 0.98 \times \text{floor}.$$
    Label validity (§5.1) is decisive for the deliverable, because drift means
-   mislabelled data. The 0.05 threshold sits well above the signature
-   error's measured noise floor on the inputs the sweep uses, synthetic images
-   (p90 0.013 under noise and under 30% occlusion). The second
+   mislabelled data. Both thresholds sit far from both ends: on synthetic
+   images degraded to look real with the lattice provably unchanged, median
+   spacing and angle error stay at 0.000 and ≤ 0.2°; an unrelated real image
+   scores 0.27 and 54° (chance). The **signature error is deliberately not
+   used here**: it does not survive the change of domain the sweep measures
+   across (§5.1, "cross-domain"). An earlier version used it, and no
+   realistic output could ever pass. The third
    condition excludes a prior that has started to reproduce training images
    (§5.6). Being 2% under the real-to-real floor counts as "well below" it.
 2. Among admissible scales, the lowest **KID** (§5.4): the distributional
    realism metric that is unbiased at this sample size.
 3. **KID ties go to label validity.** KID differences smaller than the best
    scale's subset spread are noise (§5.4), so among the scales whose KID lies
-   within that spread of the minimum, the one with the lowest signature error
-   wins.
+   within that spread of the minimum, the one with the lowest median spacing
+   error (then angle error) wins.
 
 If KID is unavailable, step 2 falls back to closeness of peak prominence to the
 real value, $|\log(\text{prominence}/\text{prominence}_{\text{real}})|$. If no
-scale is admissible, the lowest signature error is taken and the result is
-flagged for inspection rather than silently accepted.
+scale is admissible, the rule still names the scale with the lowest spacing/
+angle error, but flags it as unusable: that fallback tends to be the strongest
+guidance, i.e. outputs that copy the input. The notebook then refuses to
+proceed without an explicit, reported override.
 
 **Diversity is reported but is not a criterion.** It has a sensible range
 rather than a direction (§5.5), and a collapsed sampler already scores badly on
@@ -348,6 +359,39 @@ rule must be stated as such.
 
 **Budget.** 7 scales × 48 samples per model at 250 steps, about 2.7 GPU-hours
 per DPS model.
+
+### 4.2 Why standard DPS struggles with these operators
+
+The comparison uses **standard DPS, unmodified**: the guidance term is
+$\|y - A(\hat{x}_0)\|$ and the UVCGAN generators are used exactly as trained,
+since the study compares DPS + UVCGAN against UVCGAN. Two findings explain the
+DPS results and belong in the discussion.
+
+**Pixel guidance cannot recover the label through the trained operators.**
+The real→synth generator makes a real-looking image synth-*bright* but not
+synth-*sharp* (lattice prominence: real 1909, $G_{R\to S}(\text{real})$ 1962,
+synthetic inputs ~19600), and it leaves synthetic images nearly unchanged
+(prominence 16541 after vs 19627 before). So in the synth experiment the only
+images whose translation matches a genuine synthetic $y$ are synthetic-looking
+ones. Measured directly on 24 synthetic images: a realistic image with the
+**same** lattice (blurred, darkened, flattened, noisy) and one with a
+**different** lattice are equally far from $y$ in pixel distance (164 vs 166;
+ordered correctly 54% of the time, chance). The scale sweep shows the
+consequence. Up to $\zeta = 0.1$ outputs are realistic (KID 0.013–0.019) but
+their lattice is at chance level (median angle error 33–63° vs 54° for an
+unrelated image); larger $\zeta$ transmits some lattice (best 12°) only as
+realism collapses (KID 0.035–0.157). No scale meets the admissibility rule of
+§4.1, so its scale is a stated override.
+
+**The analytic operator's black outputs.** `dps_analytic` preserved the
+lattice almost perfectly from $\zeta = 0.03$ (median spacing error ≤ 0.02,
+angle ≤ 3°), but its outputs turned nearly black (KID 0.09–0.17). Its gradient
+is well-behaved spectrally (93% of its energy in the lattice band), but its size
+scales with $1/\text{contrast}$: 0.37 for a synthetic-looking image, 2.0 for a
+real one, 6.8 for a faint early estimate, an 18× spread. It comes from the
+operator's per-image contrast normalisation (§2.2, step 4). The likely result is
+overshoot into the sampler's clamp at −1, which the dark real-domain prior is
+close to. This is a likely mechanism, not a verified one.
 
 ---
 
@@ -407,12 +451,11 @@ model produced, and every DPS gradient taken against a mis-scaled measurement.
 output must stay in $[0,1]$). The loader uses the EMA generators (`avg_gen_*`),
 which is also what uvcgan2's own inference uses.
 
-The adapter also **projects its input onto the gray axis** (channel mean,
-broadcast back to 3 channels) before the generator. Every dataset image has
-$R=G=B$, so the generators never saw unequal channels, but the posterior-mean
-estimates $\hat{x}_0$ that DPS feeds the operator can have them. The projection
-is an exact no-op on dataset images and is linear, so differentiability is
-unaffected.
+The adapter does **nothing else**: the trained generator is used exactly as
+trained. (An earlier version also projected the input onto the gray axis,
+because every dataset image has $R=G=B$ while DPS's estimates $\hat{x}_0$ need
+not. It was removed because it modifies the operator, which the comparison
+does not allow. DPS runs made with it are regenerated.)
 
 **Generator direction is read from the model, not assumed.** uvcgan2 names
 its generators by dataset order (`gen_ab` maps `datasets[0]` to
@@ -521,6 +564,25 @@ domain (60 images per split, median / p90):
 On real sources the secondary peaks are weak, so their matching is noisy. Round-trip
 signature errors (real sources) should be read against a p90 floor of ~0.17,
 not against the synth one.
+
+**Cross-domain (synthetic source, realistic output): use spacing and angle,
+not the signature.** Synthetic lattices are sharp blobs with strong harmonics;
+realistic ones are soft. Synthetic images degraded to look real (Gaussian blur,
+darker and flatter, plus noise) **with the lattice provably unchanged**, 40
+images:
+
+| blur σ (px) | spacing med / p90 | angle med | signature med |
+|---|---|---|---|
+| 0 | 0.000 / 0.021 | 0.0° | 0.001 |
+| 2 | 0.000 / 0.715 | 0.0° | 0.109 |
+| 3 | 0.000 / 0.987 | 0.0° | 0.338 |
+| 4 | 0.009 / 0.997 | 0.2° | 0.567 |
+
+The median spacing and angle errors are robust; the signature error reads the
+lost harmonics as a different lattice, and the spacing **p90** reflects the
+10–15% of images whose dominant peak jumps to a harmonic. So in the synth
+experiment, label validity is the median spacing and angle error. Chance level,
+i.e. synth inputs paired with unrelated real images, is 0.27 and 54°.
 
 **Stratification by source lattice strength.** Reported separately for sources
 above and below the median source prominence. Where the reference is so noisy
@@ -774,7 +836,7 @@ strided lists both contain indices $0$ and $N/2$).
   limitation instead.
 - The conditioning scale is tuned on synthetic inputs and reused for the round
   trips, whose measurements come from a different distribution (§4). The
-  selection rule's thresholds (signature error 0.05, 0.98 × the memorisation
+  selection rule's thresholds (spacing error 0.05, angle 5°, 0.98 × the memorisation
   floor) are principled but still choices. Sweep tables for every model are
   reported so a reader can check that the ranking does not hinge on them.
 - The sweep uses 48 samples per scale, so KID differences between adjacent

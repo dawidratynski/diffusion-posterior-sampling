@@ -144,17 +144,15 @@ def test_non_positive_epoch_refused(tmp_path, fake_uvcgan2, epoch):
                        epoch=epoch)
 
 
-def test_adapter_projects_onto_gray_axis():
-    """Generator only ever saw R=G=B; unequal channels are averaged first."""
+def test_adapter_only_converts_range():
+    """The trained generator must see its input unmodified (no channel mixing
+    or other preprocessing) -- only the [-1,1] -> [0,1] convention change."""
     gen = Sigmoidish("g")
     a = UnitRangeAdapter(gen)
     x = torch.zeros(1, 3, 4, 4)
     x[:, 0], x[:, 1], x[:, 2] = 0.9, 0.0, -0.3
     a(x)
-    seen = gen.last_input
-    assert torch.allclose(seen[:, 0], seen[:, 1])
-    assert torch.allclose(seen[:, 1], seen[:, 2])
-    assert torch.allclose(seen[:, 0], torch.full((1, 4, 4), (0.2 + 1) / 2))
+    assert torch.allclose(gen.last_input, (x + 1) / 2)
 
 
 def test_nothing_to_load_fails_loudly(tmp_path, fake_uvcgan2):

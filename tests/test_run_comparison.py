@@ -205,8 +205,11 @@ def test_sweep_needs_no_builder_weights(tmp_path):
 # ------------------------------------------------------- scale selection ----
 
 def row(scale, sig=0.01, kid=0.02, kid_std=0.002, nn=1.13, floor=1.11,
-        prom=1200.0, real_prom=1500.0, div=0.2):
-    return {"scale": str(scale), "signature_err_median": str(sig),
+        prom=1200.0, real_prom=1500.0, div=0.2, angle=0.5):
+    """A sweep-table row. `sig` is the median SPACING error (the label-validity
+    measure the rule uses; the signature error is deliberately not used)."""
+    return {"scale": str(scale), "spacing_err_median": str(sig), "angle_err_median": str(angle),
+            "signature_err_median": "0.9",   # ignored by the rule on purpose
             "kid": "" if kid is None else str(kid),
             "kid_std": "" if kid_std is None else str(kid_std),
             "nn_dist_median": str(nn), "nn_floor": str(floor),
@@ -227,6 +230,22 @@ def test_inadmissible_scale_never_chosen_despite_best_kid():
     pick = rc.select_scale([row(0.3, sig=0.20, kid=0.001), row(1, kid=0.02),
                             row(3, kid=0.03)])
     assert pick["scale"] == 1.0
+
+
+def test_wrong_orientation_is_inadmissible():
+    """Right spacing at the wrong angle is still a mislabelled lattice."""
+    pick = rc.select_scale([row(0.3, kid=0.001, angle=30.0), row(1, kid=0.02),
+                            row(3, kid=0.03)])
+    assert pick["scale"] == 1.0
+
+
+def test_signature_error_does_not_block_admissibility():
+    """Realistic outputs score signature ~0.3-0.6 with the lattice intact
+    (harmonics blurred away), so the rule must not use it."""
+    pick = rc.select_scale([row(0.3, kid=0.03), row(1, kid=0.01),
+                            row(3, kid=0.04)])
+    assert pick["scale"] == 1.0 and not any("NO scale" in w
+                                            for w in pick["warnings"])
 
 
 def test_memorising_scale_never_chosen():
@@ -496,3 +515,15 @@ def test_evaluation_skipped_when_inputs_unchanged(tmp_path, monkeypatch):
         rc.evaluate([out], args, str(tmp_path / "p.csv"),
                     str(tmp_path / "s.csv"), paired=False, half="B")
     assert evals == ["B"]
+
+
+
+def test_dps_uvcgan_runs_from_the_gray_projection_era_regenerate(tmp_path):
+    """Only DPS-through-UVCGAN runs are marked; others keep their caches."""
+    args, paths = _setup(tmp_path, gan=True)
+    sig = lambda label: rc.run_signature(
+        next(m for m in rc.MODELS if m["label"] == label), args, paths,
+        "synth", None, 1.0, 2, 3)
+    assert sig("dps_uvcgan_gan")["operator_input"] == "unmodified"
+    assert "operator_input" not in sig("dps_analytic")
+    assert "operator_input" not in sig("uvcgan_gan")

@@ -273,6 +273,13 @@ def run_signature(model, args, paths, input_mode, rs_model, scale, samples,
         'diffusion_config': (_fingerprint(args.diffusion_config)
                              if is_dps else None),
         'task_config': _fingerprint(args.task_config),
+        # DPS through a UVCGAN operator: runs made while the operator still
+        # projected its input to gray (a modification; removed so the trained
+        # generator is used as-is) carry no such key and must regenerate.
+        # Direct UVCGAN runs and round-trip measurements are unaffected: they
+        # only ever fed the generator exactly-gray dataset images.
+        **({'operator_input': 'unmodified'}
+           if is_dps and model['dps_framework'] == 'uvcgan2' else {}),
     }
 
 
@@ -462,18 +469,30 @@ def evaluate(result_dirs, args, out_csv, summary_csv, paired, half):
 # docs/methods.md §4.1 states it for the report; keep the two in sync.
 #
 #   1. Admissible: label validity holds and the prior is not copying.
-#        signature_err_median <= SIG_ERR_MAX      (lattice preserved)
+#        spacing_err_median <= SPACING_ERR_MAX    (lattice spacing preserved)
+#        angle_err_median   <= ANGLE_ERR_MAX      (lattice orientation preserved)
 #        nn_dist_median >= NN_FLOOR_RATIO * floor (not memorising)
 #   2. Among admissible scales, the most realistic: lowest KID.
 #   3. KID differences smaller than the best scale's subset spread are noise,
-#      so among scales within that spread pick the best label validity.
+#      so among scales within that spread pick the best label validity
+#      (lowest median spacing error, then angle error).
+#
+# Why spacing + angle and NOT the signature error: the sweep compares a
+# realistic output against a SYNTHETIC source. Synthetic lattices are sharp
+# blobs with strong harmonics; realistic ones are soft. Measured on synth
+# images degraded to look real with the lattice provably unchanged (blur +
+# darker/flatter + noise): median spacing and angle error stay 0.000 / 0.0 deg
+# even at blur sigma 4, while the signature error rises to 0.11 / 0.34 / 0.57
+# at sigma 2 / 3 / 4 -- it reads lost harmonics as a wrong lattice. With a
+# signature threshold no realistic output could ever be admissible.
 #   Without KID (--no_fid_kid), realism falls back to prominence closeness to
 #   real, |log(prominence / real prominence)|.
 #
 # Diversity is reported but deliberately not a criterion: it has a sensible
 # range rather than a direction, and a near-zero value already shows up as
 # poor realism. It only raises a warning if it collapses.
-SIG_ERR_MAX = 0.05        # signature-error floor on synth sources: p90 0.013 (methods §5.1)
+SPACING_ERR_MAX = 0.05    # floor 0.000 under realistic degradation; chance 0.27 (methods §4.1)
+ANGLE_ERR_MAX = 5.0       # degrees; floor 0.0-0.2 under degradation; chance ~54
 NN_FLOOR_RATIO = 0.98     # "well below the floor" = more than 2% under it
 DIVERSITY_COLLAPSE = 0.108   # two crops of the SAME real photo (methods §5.5)
 
@@ -499,36 +518,39 @@ def select_scale(rows):
         raise ValueError('sweep table has no rows with a scale')
     warnings = []
 
-    def sig(r):
-        v = _num(r, 'signature_err_median')
-        return v if v is not None else math.inf
+    def label_err(r):
+        sp, an = _num(r, 'spacing_err_median'), _num(r, 'angle_err_median')
+        return (sp if sp is not None else math.inf,
+                an if an is not None else math.inf)
 
     def admissible(r):
-        if sig(r) > SIG_ERR_MAX:
+        sp, an = label_err(r)
+        if sp > SPACING_ERR_MAX or an > ANGLE_ERR_MAX:
             return False
         nn, floor = _num(r, 'nn_dist_median'), _num(r, 'nn_floor')
         return nn is None or floor is None or nn >= NN_FLOOR_RATIO * floor
 
     ok = [r for r in rows if admissible(r)]
     if not ok:
-        best = min(rows, key=sig)
+        best = min(rows, key=label_err)
         warnings.append(
-            f'NO scale passed the admissibility check (signature error <= '
-            f'{SIG_ERR_MAX}, NN distance >= {NN_FLOOR_RATIO} x floor). Fell '
+            f'NO scale passed the admissibility check (median spacing error <= '
+            f'{SPACING_ERR_MAX}, median angle error <= {ANGLE_ERR_MAX} deg, NN '
+            f'distance >= {NN_FLOOR_RATIO} x floor). Fell '
             'back to the best label validity, which tends to be the STRONGEST '
             'guidance -- i.e. outputs that copy the input rather than look '
             'real. Not usable as-is: inspect the scale ladder and set a scale '
             'explicitly.')
-        reason = 'fallback: lowest signature error (none admissible)'
+        reason = 'fallback: lowest spacing/angle error (none admissible)'
     elif all(_num(r, 'kid') is not None for r in ok):
         kid_best = min(ok, key=lambda r: _num(r, 'kid'))
         tol = _num(kid_best, 'kid') + (_num(kid_best, 'kid_std') or 0.0)
         near = [r for r in ok if _num(r, 'kid') <= tol]
-        best = min(near, key=lambda r: (sig(r), _num(r, 'kid')))
+        best = min(near, key=lambda r: (*label_err(r), _num(r, 'kid')))
         reason = (f'{len(ok)}/{len(rows)} admissible; {len(near)} within KID '
                   f'noise of the best ({_num(kid_best, "kid"):.5f} + '
                   f'{(_num(kid_best, "kid_std") or 0.0):.5f}); lowest '
-                  'signature error among those')
+                  'spacing/angle error among those')
     else:
         def prom_gap(r):
             p, real = _num(r, 'prominence_median'), _num(r, 'real_prominence_median')
