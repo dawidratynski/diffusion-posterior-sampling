@@ -96,6 +96,35 @@ class UnitRangeAdapter(nn.Module):
         return self.generator((x + 1.0) / 2.0) * 2.0 - 1.0
 
 
+def _uvcgan2_generator_for(path: str, direction: str):
+    '''Which of the model's own generators implements a pipeline direction.
+
+    The pipeline names directions by MEANING: 'ab' = synth -> real, 'ba' =
+    real -> synth. uvcgan2 names its generators by DATASET ORDER: gen_ab maps
+    datasets[0] -> datasets[1]. They only coincide if synth was datasets[0]
+    in training -- an assumption that used to be hard-coded. The model's
+    config.json records each dataset's domain name, so read it instead.
+
+    Returns (model_direction, note); note is '' when nothing needed saying.
+    '''
+    import json
+    import os
+    with open(os.path.join(path, 'config.json')) as fh:
+        cfg = json.load(fh)
+    try:
+        domains = [d['dataset'].get('domain') for d in cfg['data']['datasets']]
+    except (KeyError, TypeError, AttributeError):
+        domains = []
+    if sorted(domains) == ['real', 'synth']:
+        if domains[0] == 'synth':
+            return direction, ''
+        flipped = {'ab': 'ba', 'ba': 'ab'}[direction]
+        return flipped, (f'config.json has domain a = real, so pipeline '
+                         f'{direction} is the model\'s gen_{flipped}')
+    return direction, (f'domain names {domains} not recognised in config.json;'
+                       ' ASSUMING domain a = synth')
+
+
 @register_loader('uvcgan2')
 def load_uvcgan2(direction: str, path: str, epoch: int | None = None,
                  use_avg: bool = True):
@@ -132,17 +161,21 @@ def load_uvcgan2(direction: str, path: str, epoch: int | None = None,
             'directory. Point --uvcgan_path at the directory train() wrote '
             '(it contains config.json and net_gen_ab.pth).')
 
+    # `direction` is the pipeline's (ab = synth->real); `model_dir` is the
+    # name of the uvcgan2 generator that implements it in THIS model.
+    model_dir, dir_note = _uvcgan2_generator_for(path, direction)
+
     args = Args.load(path)
     model = construct_model(path, args.config, is_train=False, device='cpu')
 
     if epoch is None:
-        if os.path.exists(os.path.join(path, f'net_gen_{direction}.pth')):
+        if os.path.exists(os.path.join(path, f'net_gen_{model_dir}.pth')):
             source = 'final weights'
         else:
             epoch = model.find_last_checkpoint_epoch()
             if epoch <= 0:
                 raise FileNotFoundError(
-                    f'No final weights (net_gen_{direction}.pth) and no '
+                    f'No final weights (net_gen_{model_dir}.pth) and no '
                     f'checkpoints under {path}/checkpoints.')
             source = f'checkpoint epoch {epoch} (no final weights)'
     else:
@@ -158,14 +191,16 @@ def load_uvcgan2(direction: str, path: str, epoch: int | None = None,
         source += f', trained with loss={loss}'
 
     gens = model.models
-    name = f'gen_{direction}'
-    if use_avg and f'avg_gen_{direction}' in gens \
-            and gens[f'avg_gen_{direction}'] is not None:
-        name = f'avg_gen_{direction}'
+    name = f'gen_{model_dir}'
+    if use_avg and f'avg_gen_{model_dir}' in gens \
+            and gens[f'avg_gen_{model_dir}'] is not None:
+        name = f'avg_gen_{model_dir}'
     if name not in gens or gens[name] is None:
         raise AttributeError(
             f"'{name}' not found on the loaded UVCGAN2 model; it has "
             f'{sorted(k for k in gens if "gen" in k)}.')
+    if dir_note:
+        source += f' [{dir_note}]'
     return UnitRangeAdapter(gens[name], source=f'{name}, {source}')
 
 

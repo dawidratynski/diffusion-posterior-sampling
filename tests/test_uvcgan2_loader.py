@@ -58,8 +58,16 @@ def fake_uvcgan2(monkeypatch):
     return state
 
 
-def model_dir(tmp_path, final=True):
-    (tmp_path / "config.json").write_text("{}")
+def _config(first="synth", second="real"):
+    """config.json as uvcgan2 writes it: datasets in training order."""
+    import json
+    return json.dumps({"loss": "lsgan", "data": {"datasets": [
+        {"dataset": {"name": "cyclegan", "domain": first}},
+        {"dataset": {"name": "cyclegan", "domain": second}}]}})
+
+
+def model_dir(tmp_path, final=True, first="synth", second="real"):
+    (tmp_path / "config.json").write_text(_config(first, second))
     if final:
         for d in ("ab", "ba"):
             (tmp_path / f"net_gen_{d}.pth").write_bytes(b"")
@@ -97,6 +105,35 @@ def test_explicit_epoch_is_honoured(tmp_path, fake_uvcgan2):
     load_generator("uvcgan2", direction="ab", path=model_dir(tmp_path),
                    epoch=100)
     assert fake_uvcgan2["loaded_epoch"] == 100
+
+
+def test_reversed_domain_order_maps_to_the_other_generator(tmp_path,
+                                                           fake_uvcgan2):
+    """If training put REAL first, the model's gen_ab is real->synth.
+
+    The pipeline asks by meaning (ba = real->synth), so it must get gen_ab.
+    This is what a trained model with datasets [real, synth] looks like; the
+    old hard-coded assumption returned the synth->real generator instead.
+    """
+    path = model_dir(tmp_path, first="real", second="synth")
+    rs = load_generator("uvcgan2", direction="ba", path=path)
+    sr = load_generator("uvcgan2", direction="ab", path=path)
+    assert rs.generator.tag == "avg_gen_ab"
+    assert sr.generator.tag == "avg_gen_ba"
+    assert "domain a = real" in rs.source
+
+
+def test_standard_domain_order_needs_no_note(tmp_path, fake_uvcgan2):
+    g = load_generator("uvcgan2", direction="ba", path=model_dir(tmp_path))
+    assert g.generator.tag == "avg_gen_ba"
+    assert "[" not in g.source          # nothing assumed, nothing flipped
+
+
+def test_unnamed_domains_fall_back_loudly(tmp_path, fake_uvcgan2):
+    path = model_dir(tmp_path, first="A", second="B")
+    g = load_generator("uvcgan2", direction="ba", path=path)
+    assert g.generator.tag == "avg_gen_ba"
+    assert "ASSUMING domain a = synth" in g.source
 
 
 @pytest.mark.parametrize("epoch", [0, -1])

@@ -414,6 +414,14 @@ estimates $\hat{x}_0$ that DPS feeds the operator can have them. The projection
 is an exact no-op on dataset images and is linear, so differentiability is
 unaffected.
 
+**Generator direction is read from the model, not assumed.** uvcgan2 names
+its generators by dataset order (`gen_ab` maps `datasets[0]` to
+`datasets[1]`), not by meaning. The loader reads the domain names recorded in
+the model's `config.json` and maps the pipeline's synth→real and real→synth
+onto whichever generator implements them, so a model trained with the real
+dataset first is used correctly. Unnamed domains fall back to "domain a =
+synth", and the probe output says so.
+
 **GAN and WGAN directories are verified, not trusted.** uvcgan2 names the
 model directory from model, discriminator, generator and label, not the loss,
 so both runs produce identically named directories that are told apart only
