@@ -514,8 +514,11 @@ def select_scale(rows):
         best = min(rows, key=sig)
         warnings.append(
             f'NO scale passed the admissibility check (signature error <= '
-            f'{SIG_ERR_MAX}, NN distance >= {NN_FLOOR_RATIO} x floor). Chose '
-            'the best label validity instead -- inspect before using.')
+            f'{SIG_ERR_MAX}, NN distance >= {NN_FLOOR_RATIO} x floor). Fell '
+            'back to the best label validity, which tends to be the STRONGEST '
+            'guidance -- i.e. outputs that copy the input rather than look '
+            'real. Not usable as-is: inspect the scale ladder and set a scale '
+            'explicitly.')
         reason = 'fallback: lowest signature error (none admissible)'
     elif all(_num(r, 'kid') is not None for r in ok):
         kid_best = min(ok, key=lambda r: _num(r, 'kid'))
