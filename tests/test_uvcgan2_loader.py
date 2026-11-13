@@ -32,10 +32,14 @@ class Sigmoidish(nn.Module):
 
 @pytest.fixture
 def fake_uvcgan2(monkeypatch):
-    state = {"loaded_epoch": "unset", "last_ckpt": 50, "avg": True}
+    state = {"loaded_epoch": "unset", "last_ckpt": 50, "avg": True,
+             "model_args": {"lambda_a": 10.0, "avg_momentum": 0.9999}}
 
     class Model:
-        def __init__(self):
+        # Mirrors uvcgan2's UVCGAN2: an explicit keyword list, no **kwargs, so
+        # an unknown model_arg raises TypeError exactly like the real class.
+        def __init__(self, savedir, config, is_train, device,
+                     lambda_a=10.0, lambda_idt=0.5, avg_momentum=None):
             names = ["gen_ab", "gen_ba"]
             if state["avg"]:
                 names += ["avg_gen_ab", "avg_gen_ba"]
@@ -49,9 +53,15 @@ def fake_uvcgan2(monkeypatch):
 
     cfg_mod = types.ModuleType("uvcgan2.config")
     cfg_mod.Args = types.SimpleNamespace(
-        load=lambda path: types.SimpleNamespace(config=object(), savedir=path))
+        load=lambda path: types.SimpleNamespace(
+            config=types.SimpleNamespace(
+                model="uvcgan2", model_args=dict(state["model_args"])),
+            savedir=path))
     cgan_mod = types.ModuleType("uvcgan2.cgan")
-    cgan_mod.construct_model = lambda savedir, config, is_train, device: Model()
+    cgan_mod.CGAN_MODELS = {"uvcgan2": Model}
+    # As uvcgan2.cgan.construct_model: model_args go straight to the class.
+    cgan_mod.construct_model = lambda savedir, config, is_train, device: Model(
+        savedir, config, is_train, device, **config.model_args)
     monkeypatch.setitem(sys.modules, "uvcgan2", types.ModuleType("uvcgan2"))
     monkeypatch.setitem(sys.modules, "uvcgan2.config", cfg_mod)
     monkeypatch.setitem(sys.modules, "uvcgan2.cgan", cgan_mod)
@@ -186,3 +196,19 @@ def test_adapter_keeps_gradient_for_dps():
     x = torch.zeros(1, 3, 8, 8, requires_grad=True)
     (g,) = torch.autograd.grad(a(x).sum(), x)
     assert torch.isfinite(g).all() and g.abs().sum() > 0
+
+
+def test_training_only_model_args_from_newer_uvcgan2_are_ignored_and_reported(
+        tmp_path, fake_uvcgan2):
+    """The WGAN run's config has `discriminator_steps: 5`, which the pinned
+    uvcgan2 does not know: construct_model raised TypeError. It is a training
+    setting, so loading must succeed and SAY it ignored it."""
+    fake_uvcgan2["model_args"]["discriminator_steps"] = 5
+    g = load_generator("uvcgan2", direction="ba", path=model_dir(tmp_path))
+    assert g.generator.tag == "avg_gen_ba"
+    assert "ignored" in g.source and "discriminator_steps" in g.source
+
+
+def test_known_model_args_are_not_reported(tmp_path, fake_uvcgan2):
+    g = load_generator("uvcgan2", direction="ba", path=model_dir(tmp_path))
+    assert "ignored" not in g.source

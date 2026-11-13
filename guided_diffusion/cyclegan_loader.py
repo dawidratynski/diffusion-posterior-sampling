@@ -123,6 +123,37 @@ def _uvcgan2_generator_for(path: str, direction: str):
                        ' ASSUMING domain a = synth')
 
 
+def _drop_unknown_model_args(config):
+    '''Remove model_args the installed uvcgan2 model class does not accept.
+
+    model_args are the TRAINING loop's settings (loss weights, discriminator
+    steps per generator step, ...); the generator architecture comes from
+    config.generator. A model trained with a newer or modified uvcgan2 can
+    carry settings the installed version lacks -- the WGAN run's
+    `discriminator_steps: 5` (critic updates per generator update) made
+    construct_model fail with a TypeError. They do not affect inference, so
+    they are dropped and REPORTED (in the loaded generator's `source`, which
+    the probe prints). An architecture change cannot slip through this way:
+    loading the weights is strict about names and shapes.
+    '''
+    import inspect
+
+    from uvcgan2.cgan import CGAN_MODELS
+
+    cls = CGAN_MODELS.get(config.model)
+    model_args = dict(config.model_args or {})
+    if cls is None:
+        return []
+    params = inspect.signature(cls.__init__).parameters
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return []
+    dropped = sorted(k for k in model_args if k not in params)
+    if dropped:
+        config.model_args = {k: v for k, v in model_args.items()
+                             if k not in dropped}
+    return dropped
+
+
 @register_loader('uvcgan2')
 def load_uvcgan2(direction: str, path: str, epoch: int | None = None,
                  use_avg: bool = True):
@@ -164,6 +195,7 @@ def load_uvcgan2(direction: str, path: str, epoch: int | None = None,
     model_dir, dir_note = _uvcgan2_generator_for(path, direction)
 
     args = Args.load(path)
+    dropped = _drop_unknown_model_args(args.config)
     model = construct_model(path, args.config, is_train=False, device='cpu')
 
     if epoch is None:
@@ -199,6 +231,9 @@ def load_uvcgan2(direction: str, path: str, epoch: int | None = None,
             f'{sorted(k for k in gens if "gen" in k)}.')
     if dir_note:
         source += f' [{dir_note}]'
+    if dropped:
+        source += (f' [ignored training-only model_args unknown to the '
+                   f'installed uvcgan2: {dropped}]')
     return UnitRangeAdapter(gens[name], source=f'{name}, {source}')
 
 
