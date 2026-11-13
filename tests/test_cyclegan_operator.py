@@ -241,12 +241,38 @@ def _spectral_lattice(period=20.0, angle=20.0, n=160, contrast=1.0, mean=0.0,
     return torch.from_numpy(img).float().expand(1, 3, n, n).clone()
 
 
-def test_spectral_operator_ignores_brightness_exactly():
-    """Brightness is in the null space by construction (mean removed first)."""
-    op = get_operator(name="cyclegan", device="cpu", framework="spectral",
-                      direction="ba", gamma=0.4)
+def test_spectral_lattice_part_ignores_brightness():
+    """Steps 0-2 never see brightness (mean removed first)."""
+    from guided_diffusion.cyclegan_loader import SpectralIdealizer
+    op = SpectralIdealizer()
     x = _spectral_lattice(mean=-0.5)
-    assert torch.allclose(op.forward(x), op.forward(x + 0.35), atol=1e-5)
+    assert torch.allclose(op.idealise(x), op.idealise(x + 0.35), atol=1e-5)
+
+
+def test_spectral_brightness_maps_quantile_to_quantile():
+    """Real brightness at the k-th percentile -> synthetic brightness at the
+    k-th percentile; monotone; and DPS guidance now constrains brightness."""
+    from guided_diffusion.cyclegan_loader import (
+        BRIGHTNESS_QUANTILES_REAL as QR,
+    )
+    from guided_diffusion.cyclegan_loader import (
+        BRIGHTNESS_QUANTILES_SYNTH as QS,
+    )
+    from guided_diffusion.cyclegan_loader import (
+        SpectralIdealizer,
+    )
+    op = SpectralIdealizer()
+    flat = lambda m: torch.full((1, 3, 8, 8), m)
+    for k in (2, 10, 18):                                # 10th/50th/90th pct
+        assert abs(float(op.brightness(flat(QR[k]))) - QS[k]) < 1e-5
+    levels = torch.linspace(-1, 1, 41)
+    b = torch.cat([op.brightness(flat(float(v))).flatten() for v in levels])
+    assert (b.diff() > 0).all()
+
+    x = _spectral_lattice(mean=-0.5).requires_grad_()
+    y = op(_spectral_lattice(mean=-0.5, seed=1)).detach() + 0.2   # brighter y
+    (g,) = torch.autograd.grad(torch.linalg.norm(y - op(x)), x)
+    assert float(g.mean()) < 0          # descent raises x's brightness
 
 
 def test_spectral_output_contrast_is_proportional_to_input():

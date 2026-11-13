@@ -251,10 +251,33 @@ def load_torchscript(direction: str, path: str):
 # does, give it a name that cannot be mistaken for a real one.
 
 
-# Gain of step 4, calibrated ONCE with SpectralIdealizer.calibrate_gain on 400
+# Gain of step 3, calibrated ONCE with SpectralIdealizer.calibrate_gain on 400
 # strided real/train images at 160 px (median output std = target_std). The
 # calibration set is the training split, disjoint from everything evaluated.
 SPECTRAL_GAIN = 5.261
+
+# Brightness quantiles of step 3: per-image mean brightness ([-1, 1]) at the
+# 0, 5, ..., 100th percentiles, over 800 strided real/train and synth/train
+# images at 160 px (SpectralIdealizer.calibrate_brightness). Measured rather
+# than a normal fit: the two distributions are skewed in opposite directions
+# (real +0.62, synth -0.76), which a normal fit misses by up to 0.14 in the
+# tails. Both strictly increasing, so the mapping is monotone.
+BRIGHTNESS_QUANTILES_REAL = (
+    -0.9452, -0.7796, -0.7333, -0.7103, -0.6880, -0.6687, -0.6490, -0.6250,
+    -0.5997, -0.5770, -0.5533, -0.5346, -0.5123, -0.4835, -0.4556, -0.4137,
+    -0.3635, -0.3062, -0.2615, -0.1946, 0.2244)
+BRIGHTNESS_QUANTILES_SYNTH = (
+    -0.0958, 0.1889, 0.2417, 0.2868, 0.3275, 0.3619, 0.3942, 0.4296,
+    0.4624, 0.4793, 0.4964, 0.5185, 0.5431, 0.5587, 0.5778, 0.5925,
+    0.6048, 0.6180, 0.6347, 0.6516, 0.7089)
+
+
+def _interp(v, xp, fp):
+    '''Piecewise-linear map xp -> fp at v (1-D), extrapolating linearly past
+    the ends; differentiable in v.'''
+    i = torch.searchsorted(xp, v.detach().contiguous()).clamp(1, len(xp) - 1)
+    x0, x1, y0, y1 = xp[i - 1], xp[i], fp[i - 1], fp[i]
+    return y0 + (v - x0) * (y1 - y0) / (x1 - x0)
 
 
 class SpectralIdealizer(nn.Module):
@@ -264,8 +287,8 @@ class SpectralIdealizer(nn.Module):
     illumination gradient; synthetic ones are clean, bright and near-perfectly
     periodic. This caricatures that mapping in four steps (methods §2.2):
 
-      0. remove brightness: subtract the image mean, so the spectrum has no DC
-         term. Brightness is therefore exactly in the operator's null space.
+      0. separate brightness: subtract the image mean, so the spectrum has no
+         DC term (steps 1-2 never see brightness; step 3 maps it separately).
       1. band-pass to lattice periods min_period..max_period px: removes the
          slow illumination blob (42% of real power sits at radius <= 3) and
          near-Nyquist pixel noise,
@@ -282,9 +305,22 @@ class SpectralIdealizer(nn.Module):
 
          0.4 lands closest; 1.0 overshot by 20x and started to disturb the
          lattice itself (median spacing error 0.023 vs 0.000 at 0.4),
-      3. map to the synthetic domain's intensity: multiply by a FIXED gain and
-         add the synthetic mean. The gain is calibrated once so a typical real
-         image comes out with synthetic contrast (target_std 0.38).
+      3. map to the synthetic domain's intensity: multiply by a FIXED gain
+         (calibrated once so a typical real image comes out with synthetic
+         contrast, target_std 0.38) and add the brightness of the SAME
+         QUANTILE in the synthetic domain: an image at the k-th percentile of
+         real brightness gets the k-th percentile of synthetic brightness.
+
+    Why map brightness instead of discarding it: when step 0's mean was simply
+    dropped, brightness was in the operator's null space, so DPS guidance put
+    no constraint on it at all and each sample's brightness was whatever the
+    prior produced -- and the prior is over-dispersed (variants of one input
+    differed more than unrelated real photos), giving many near-black and
+    near-white samples. The trained UVCGAN operator maps brightness itself,
+    which is why its DPS samples did not show this. The quantile map gives the
+    analytic operator the same kind of constraint, and keeps the real
+    brightness distribution: guidance pulls a sample toward the real
+    brightness whose quantile matches its synthetic input's.
 
     Why a fixed gain, not each image's own contrast: dividing by the image's
     std made the DPS guidance gradient scale with 1/contrast -- 13.6x larger
@@ -307,16 +343,18 @@ class SpectralIdealizer(nn.Module):
     '''
 
     def __init__(self, gamma: float = 0.4, min_period: float = 4.0,
-                 max_period: float = 37.5, target_mean: float = 0.47,
-                 gain: float = SPECTRAL_GAIN, softness: float = 1.5):
+                 max_period: float = 37.5, gain: float = SPECTRAL_GAIN,
+                 softness: float = 1.5,
+                 quantiles_real=BRIGHTNESS_QUANTILES_REAL,
+                 quantiles_synth=BRIGHTNESS_QUANTILES_SYNTH):
         super().__init__()
         self.gamma = gamma
         self.min_period = min_period
         self.max_period = max_period
-        # Synthetic-domain mean in [-1, 1]: measured 188/255 over the synth split.
-        self.target_mean = target_mean
         self.gain = gain
         self.softness = softness
+        self.register_buffer('q_real', torch.tensor(quantiles_real))
+        self.register_buffer('q_synth', torch.tensor(quantiles_synth))
 
     def _bandpass(self, h, w, device, dtype):
         fy = torch.fft.fftshift(torch.fft.fftfreq(h, device=device)) * h
@@ -345,8 +383,16 @@ class SpectralIdealizer(nn.Module):
         spec = spec * weight * band
         return torch.fft.ifft2(torch.fft.ifftshift(spec, dim=(-2, -1))).real
 
+    def brightness(self, x):
+        '''Step 3's brightness: the synthetic brightness at the same quantile
+        as x's mean brightness among real images. Shape (N, 1, 1, 1).'''
+        m = x.mean(dim=(-3, -2, -1))
+        q_real = self.q_real.to(m.dtype)
+        q_synth = self.q_synth.to(m.dtype)
+        return _interp(m, q_real, q_synth).view(-1, 1, 1, 1)
+
     def forward(self, x):
-        out = self.idealise(x) * self.gain + self.target_mean              # 3
+        out = self.idealise(x) * self.gain + self.brightness(x)            # 3
         return out.clamp(-1.0, 1.0)
 
     @classmethod
@@ -358,16 +404,28 @@ class SpectralIdealizer(nn.Module):
         stds = cls(**kwargs).idealise(real_images).std(dim=(-3, -2, -1))
         return float(target_std / stds.median())
 
+    @staticmethod
+    @torch.no_grad()
+    def calibrate_brightness(real_images, synth_images, n_quantiles=21):
+        '''The step-3 quantile tables: per-image mean brightness of each domain
+        at evenly spaced percentiles. How BRIGHTNESS_QUANTILES_* were obtained
+        (800 strided images from each train split, 160 px).'''
+        q = torch.linspace(0, 1, n_quantiles, dtype=torch.float64)
+        return tuple(
+            tuple(float(v) for v in torch.quantile(
+                imgs.mean(dim=(-3, -2, -1)).double(), q))
+            for imgs in (real_images, synth_images))
+
 
 @register_loader('spectral')
 def load_spectral(direction: str, gamma: float = 0.4, min_period: float = 4.0,
-                  max_period: float = 37.5, target_mean: float = 0.47,
-                  gain: float = SPECTRAL_GAIN, softness: float = 1.5):
+                  max_period: float = 37.5, gain: float = SPECTRAL_GAIN,
+                  softness: float = 1.5):
     if direction != 'ba':
         raise ValueError(
             'SpectralIdealizer only models real -> synth (direction: ba). '
             'There is no analytic stand-in for the synth -> real direction; '
             'use the trained generator for the baseline.')
     return SpectralIdealizer(gamma=gamma, min_period=min_period,
-                             max_period=max_period, target_mean=target_mean,
-                             gain=gain, softness=softness)
+                             max_period=max_period, gain=gain,
+                             softness=softness)

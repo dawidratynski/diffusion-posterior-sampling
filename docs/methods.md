@@ -91,8 +91,9 @@ DFT and $F = \mathcal{F}(x)$, with frequencies centred (fftshift) so that the
 DC component sits at the array centre. Let $r(u,v)=\sqrt{u^2+v^2}$ be the radius
 in cycles-per-image of frequency bin $(u,v)$, and $n=\min(H,W)$.
 
-**Step 0 — remove brightness.** Subtract the image mean $\bar{x}$ (over all
+**Step 0 — separate brightness.** Subtract the image mean $\bar{x}$ (over all
 channels and pixels), so that $F = \mathcal{F}(x - \bar{x})$ has no DC term.
+Steps 1–2 work on the lattice alone; step 3 handles $\bar{x}$.
 
 **Step 1 — band-pass.** With $\rho_{\min}, \rho_{\max}$ the smallest and largest
 lattice periods to retain (defaults 4 px and 37.5 px) and $\sigma$ a softness
@@ -106,12 +107,18 @@ $M = |F|$ and $M_{\max} = \max_{u,v} M(u,v)\,W_{\text{band}}(u,v)$ (per image),
 $$W_{\text{sharp}}(u,v) \;=\; \left(\frac{M(u,v)}{M_{\max}}\right)^{\gamma}, \qquad
 \tilde{x} \;=\; \Re\,\mathcal{F}^{-1}\!\big(F \cdot W_{\text{sharp}} \cdot W_{\text{band}}\big)$$
 
-**Step 3 — map to synthetic intensity, with a fixed gain.**
+**Step 3 — map to synthetic intensity: fixed gain, brightness by quantile.**
 
-$$A(x) \;=\; \mathrm{clip}_{[-1,1]}\!\left(g\,\tilde{x} + \mu_S\right)$$
+$$A(x) \;=\; \mathrm{clip}_{[-1,1]}\!\left(g\,\tilde{x} + Q_S\big(Q_R^{-1}(\bar{x})\big)\right)$$
 
-$\mu_S = 0.47$ is the synthetic mean (mean pixel value $188.2/255$, mapped to
-$[-1,1]$). The gain $g = 5.261$ is calibrated **once**: it is the value at which
+$Q_R, Q_S$ are the quantile functions of per-image mean brightness in the real
+and synthetic domains, so an image at the $k$-th percentile of real brightness
+gets the $k$-th percentile of synthetic brightness. They are measured, not
+assumed normal: 21 quantiles (every 5%) over 800 strided images from each
+training split (`SpectralIdealizer.calibrate_brightness`), linearly
+interpolated. The two distributions are skewed in opposite directions (real
++0.62, synth −0.76), which a normal fit misses by up to 0.14 in the tails. The
+map is monotone. The gain $g = 5.261$ is calibrated **once**: it is the value at which
 a typical real image comes out with synthetic contrast, i.e. median per-image
 std of $g\tilde{x}$ equal to $\sigma_S = 0.38$ (std $49.1/255$), over 400 strided
 `real/train` images (`SpectralIdealizer.calibrate_gain`). The calibration set is
@@ -131,8 +138,25 @@ mask. A discrete mask would make $A$ piecewise constant in $x$, giving
 discontinuous jumps in the DPS gradient. Smoothness here is a requirement, not
 an aesthetic choice (see §4).
 
-**Removing the mean first** puts brightness exactly in the null space, by
-construction rather than approximately (§2.5).
+**Separating the mean first** keeps brightness out of the lattice steps
+entirely; it then gets its own, explicit mapping in step 3.
+
+**Brightness is mapped by quantile, not discarded.** An earlier version simply
+dropped it, which put brightness in the operator's null space. DPS guidance
+then constrained it not at all, and each sample's brightness was whatever the
+prior produced. The prior is over-dispersed: variants of one input differed by
+0.27–0.39 RMSE at near-unconditional scales, more than two unrelated real
+photos (~0.16). So `dps_analytic` produced many near-black and near-white
+samples. The trained UVCGAN operator maps brightness itself (real-dark to
+synth-bright), which is why its DPS samples did not show this. The quantile map
+gives the analytic operator the same kind of constraint while keeping the real
+brightness distribution: on real validation images $A$'s output brightness is
+mean 0.435, spread 0.134, against synthetic 0.485, 0.141. A guidance-only check
+showed the old operator leaves brightness untouched, and the mapped one pulls it
+toward the real brightness that matches the input's quantile. That pull is
+weak, about 4% of the typical per-pixel guidance, since most of the residual is
+the lattice. Whether it suffices against the prior's spread is answered by the
+sweep, not by this check.
 
 **The band-pass** removes two things. Below $n/\rho_{\max}$ lie slow
 illumination gradients, which carry **42% of total power** in real micrographs
@@ -181,13 +205,15 @@ label-validity metric measures.
 - **Differentiable.** Required; see §4.
 - **Output contrast is proportional to input lattice contrast** (fixed gain),
   so faint and sharp estimates get comparable guidance (§2.3).
-- **Brightness lies in its null space, exactly.** Step 0 removes the mean, so
-  $A(x + c) = A(x)$ for any constant $c$ (verified to $4\times10^{-7}$).
-  Consequently the data-consistency term exerts **zero gradient** on
-  output brightness, which is supplied entirely by the prior. Observed
-  decorrelation between input and output brightness is therefore expected
-  behaviour, not a defect — and for augmentation it is desirable, since
-  brightness is nuisance variation that should be sampled rather than copied.
+- **Brightness is mapped by quantile (step 3); the lattice part is blind to
+  it.** $\tilde{x}$ is exactly invariant to adding a constant, and output
+  brightness depends only on the input's brightness quantile. An earlier
+  definition kept brightness in the null space, on the reasoning that it is
+  nuisance variation to be sampled from the prior rather than copied. That
+  only works if the prior's brightness distribution is realistic, and this
+  prior's is over-dispersed (§2.3). Matching quantiles still lets brightness
+  vary, but realistically: it follows the real distribution rather than
+  either copying the synthetic input or drifting freely.
 - **It is not a faithful model of $G_{R\to S}$.** Its output is sinusoidal;
   true synth images are blob-like with sharp edges. It reproduces the *global
   periodicity* of the synth domain but not its local morphology. This is the

@@ -138,8 +138,7 @@ def build_operator(measure_cfg, framework, direction, device, uvcgan_path):
     # Framework-specific settings in the task config would be rejected by a
     # different framework's loader, so keep only what this one accepts.
     if framework != 'spectral':
-        for k in ('gamma', 'min_period', 'max_period', 'target_mean',
-                  'gain', 'softness'):
+        for k in ('gamma', 'min_period', 'max_period', 'gain', 'softness'):
             cfg.pop(k, None)
     if framework in ('uvcgan2', 'cyclegan_resnet', 'torchscript'):
         if not uvcgan_path:

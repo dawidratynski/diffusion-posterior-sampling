@@ -96,7 +96,7 @@ RS_MODELS = {
 
 # Bump whenever SpectralIdealizer's definition changes, so cached results made
 # with the old operator are not reused (the run signature does not hash code).
-SPECTRAL_OPERATOR_VERSION = 'v2-fixed-gain'
+SPECTRAL_OPERATOR_VERSION = 'v3-brightness-quantiles'
 
 
 def weight_paths(args):
